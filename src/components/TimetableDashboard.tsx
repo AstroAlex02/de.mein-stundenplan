@@ -78,154 +78,280 @@ export function getLessonRoomFormat(lesson?: {
 }
 
 // Fixed university time slot definitions
-const TIME_SLOTS = [
-  { index: 0, start: '08:00', end: '09:30', timeNum: 800, row: 2 },
-  { index: 1, start: '09:45', end: '11:15', timeNum: 945, row: 3 },
-  { index: 2, start: '11:30', end: '13:00', timeNum: 1130, row: 4 },
-  // Row 5: Mittagspause 13:00 - 14:00 (no merging across this row!)
-  { index: 3, start: '14:00', end: '15:30', timeNum: 1400, row: 6 },
-  { index: 4, start: '15:45', end: '17:15', timeNum: 1545, row: 7 },
-  { index: 5, start: '17:30', end: '19:00', timeNum: 1730, row: 8 },
-  { index: 6, start: '19:15', end: '20:45', timeNum: 1915, row: 9 }
+export interface TimeSlotDef {
+  index: number;
+  start: string;
+  end: string;
+  timeNum: number;
+  row: number;
+  group: 'morning' | 'afternoon';
+}
+
+const TIME_SLOTS: TimeSlotDef[] = [
+  { index: 0, start: '08:00', end: '09:30', timeNum: 800, row: 2, group: 'morning' },
+  { index: 1, start: '09:45', end: '11:15', timeNum: 945, row: 3, group: 'morning' },
+  { index: 2, start: '11:30', end: '13:00', timeNum: 1130, row: 4, group: 'morning' },
+  // Row 5: Mittagspause 13:00 - 14:00 (Strikte Trennung: Fächer werden über die Mittagspause NIEMALS verbunden!)
+  { index: 3, start: '14:00', end: '15:30', timeNum: 1400, row: 6, group: 'afternoon' },
+  { index: 4, start: '15:45', end: '17:15', timeNum: 1545, row: 7, group: 'afternoon' },
+  { index: 5, start: '17:30', end: '19:00', timeNum: 1730, row: 8, group: 'afternoon' },
+  { index: 6, start: '19:15', end: '20:45', timeNum: 1915, row: 9, group: 'afternoon' }
 ];
 
-interface DayBlock {
+export interface DayGridCard {
   key: string;
   startRow: number;
   rowSpan: number;
   isMerged: boolean;
-  lessons: TimetableLesson[];
+  mergedCount: number;
+  mergedLesson: TimetableLesson;
+  lane: number;
+  totalLanes: number;
+  widthPct: number;
+  leftPct: number;
 }
 
-function getLessonsForSlot(dayLessons: TimetableLesson[], slotTimeNum: number): TimetableLesson[] {
-  const slotStart = slotTimeNum;
-  const slotEnd = slotStart + 130;
-  return dayLessons.filter(l =>
-    (l.startTime >= slotStart && l.startTime < slotEnd) ||
-    (l.startTime <= slotStart && l.endTime > slotStart)
-  );
+function timeNumToMinutes(timeNum: number): number {
+  const h = Math.floor(timeNum / 100);
+  const m = timeNum % 100;
+  return h * 60 + m;
+}
+
+const SLOT_RANGES = TIME_SLOTS.map(slot => {
+  const startMin = timeNumToMinutes(slot.timeNum);
+  const endMin = startMin + 90;
+  return { ...slot, startMin, endMin };
+});
+
+function getLessonsForSlot(dayLessons: TimetableLesson[], slotIdx: number): TimetableLesson[] {
+  const slot = SLOT_RANGES[slotIdx];
+  return dayLessons.filter(l => {
+    const lStartMin = timeNumToMinutes(l.startTime);
+    const lEndMin = timeNumToMinutes(l.endTime);
+    // Overlap condition with 5-minute tolerance
+    return Math.max(lStartMin, slot.startMin) < Math.min(lEndMin, slot.endMin) - 5;
+  });
 }
 
 /**
- * Computes grid blocks for a single day:
- * - Identifies overlapping lessons (sit side-by-side)
- * - Merges 2 consecutive lessons of the same subject into one block (rowSpan = 2)
- * - Strictly prevents merging across lunch break (13:00 to 14:00)
+ * Merges consecutive periods of the same subject into a single unified TimetableLesson.
  */
-function computeDayGridBlocks(dayLessons: TimetableLesson[]): DayBlock[] {
-  const blocks: DayBlock[] = [];
-  const handledSlotIndices = new Set<number>();
+function mergeLessonChain(lessons: TimetableLesson[]): TimetableLesson {
+  if (lessons.length === 1) return lessons[0];
+  const first = lessons[0];
+  const last = lessons[lessons.length - 1];
 
-  for (let s = 0; s < TIME_SLOTS.length; s++) {
-    if (handledSlotIndices.has(s)) continue;
+  // Pick physical room if available
+  const physicalRoom = lessons.find(l => {
+    const r = (l.roomName || '').trim();
+    return r && r !== '-' && r !== '—' && r.toLowerCase() !== 'kein raum';
+  });
+  const roomName = physicalRoom ? physicalRoom.roomName : (first.roomName || last.roomName);
+  const roomLongName = physicalRoom ? physicalRoom.roomLongName : (first.roomLongName || last.roomLongName);
 
-    const currentSlot = TIME_SLOTS[s];
-    const currentLessons = getLessonsForSlot(dayLessons, currentSlot.timeNum);
+  const isHybrid = lessons.some(l => l.isHybrid);
+  const isCancelled = lessons.every(l => l.isCancelled);
+  const isSubstitution = lessons.some(l => l.isSubstitution);
+  const teacherName = lessons.map(l => l.teacherName).find(Boolean) || first.teacherName;
+  const teacherLongName = lessons.map(l => l.teacherLongName).find(Boolean) || first.teacherLongName;
+  
+  const substTexts = Array.from(new Set(lessons.map(l => l.substText).filter(Boolean)));
 
-    if (currentLessons.length === 0) {
-      blocks.push({
-        key: `slot-${s}`,
-        startRow: currentSlot.row,
-        rowSpan: 1,
-        isMerged: false,
-        lessons: []
+  return {
+    ...first,
+    id: `${first.id}_merged_${lessons.length}x_${last.id}`,
+    endTime: Math.max(...lessons.map(l => l.endTime)),
+    endTimeStr: last.endTimeStr || first.endTimeStr,
+    roomName,
+    roomLongName,
+    isHybrid,
+    isCancelled,
+    isSubstitution,
+    teacherName,
+    teacherLongName,
+    substText: substTexts.join(' | ')
+  };
+}
+
+/**
+ * Computes grid cards for a single day:
+ * 1. Merges arbitrarily many consecutive periods of the same subject (2x, 3x, 4x, etc.)
+ * 2. Strictly separates morning (Slots 0..2) and afternoon (Slots 3..6) so NO merge crosses the Mittagspause
+ * 3. Assigns deterministic parallel lanes so multi-period lessons keep their horizontal position and do not shift or break
+ */
+function computeDayGridCards(dayLessons: TimetableLesson[]): DayGridCard[] {
+  const cards: DayGridCard[] = [];
+
+  // Strictly independent time zones (Mittagspause 13:00 - 14:00 is NEVER bridged)
+  const groups: Array<{ name: string; slotIndices: number[] }> = [
+    { name: 'morning', slotIndices: [0, 1, 2] },
+    { name: 'afternoon', slotIndices: [3, 4, 5, 6] }
+  ];
+
+  for (const group of groups) {
+    interface InternalChain {
+      subjectKey: string;
+      isCancelled: boolean;
+      startSlot: number;
+      endSlot: number;
+      lessons: TimetableLesson[];
+      lane: number;
+      totalLanes: number;
+      widthPct: number;
+      leftPct: number;
+    }
+
+    const completedChains: InternalChain[] = [];
+    let activeChains: InternalChain[] = [];
+
+    for (const s of group.slotIndices) {
+      const lessonsInSlot = getLessonsForSlot(dayLessons, s);
+      const remainingLessons = [...lessonsInSlot];
+
+      const nextActiveChains: InternalChain[] = [];
+
+      // Extend existing active chains that ended at slot s - 1
+      for (const chain of activeChains) {
+        if (chain.endSlot === s - 1) {
+          const matchIdx = remainingLessons.findIndex(l =>
+            l.subjectName.trim().toLowerCase() === chain.subjectKey &&
+            Boolean(l.isCancelled) === chain.isCancelled
+          );
+
+          if (matchIdx !== -1) {
+            const matched = remainingLessons.splice(matchIdx, 1)[0];
+            chain.endSlot = s;
+            chain.lessons.push(matched);
+            nextActiveChains.push(chain);
+            continue;
+          }
+        }
+        completedChains.push(chain);
+      }
+
+      // Any remaining lessons start new chains at slot s
+      for (const lesson of remainingLessons) {
+        nextActiveChains.push({
+          subjectKey: lesson.subjectName.trim().toLowerCase(),
+          isCancelled: Boolean(lesson.isCancelled),
+          startSlot: s,
+          endSlot: s,
+          lessons: [lesson],
+          lane: 0,
+          totalLanes: 1,
+          widthPct: 100,
+          leftPct: 0
+        });
+      }
+
+      activeChains = nextActiveChains;
+    }
+
+    completedChains.push(...activeChains);
+
+    if (completedChains.length === 0) continue;
+
+    // Cluster overlapping chains into connected components
+    const clusters: InternalChain[][] = [];
+    const visited = new Set<InternalChain>();
+
+    for (const chain of completedChains) {
+      if (visited.has(chain)) continue;
+
+      const cluster: InternalChain[] = [];
+      const queue: InternalChain[] = [chain];
+      visited.add(chain);
+
+      while (queue.length > 0) {
+        const curr = queue.shift()!;
+        cluster.push(curr);
+
+        for (const other of completedChains) {
+          if (!visited.has(other)) {
+            const overlaps = Math.max(curr.startSlot, other.startSlot) <= Math.min(curr.endSlot, other.endSlot);
+            if (overlaps) {
+              visited.add(other);
+              queue.push(other);
+            }
+          }
+        }
+      }
+
+      clusters.push(cluster);
+    }
+
+    // Assign parallel lanes in each cluster with consistent positioning
+    for (const cluster of clusters) {
+      // Sort chains:
+      // 1. Earlier start slot first
+      // 2. Longer duration first (longer blocks get Lane 0 on the left!)
+      // 3. SubjectKey alphabetically (strictly deterministic order!)
+      cluster.sort((a, b) => {
+        if (a.startSlot !== b.startSlot) return a.startSlot - b.startSlot;
+        const durA = a.endSlot - a.startSlot;
+        const durB = b.endSlot - b.startSlot;
+        if (durA !== durB) return durB - durA;
+        return a.subjectKey.localeCompare(b.subjectKey);
       });
-      continue;
-    }
 
-    // Merge check with next slot (s + 1)
-    // Rule: DO NOT merge across lunch break (Slot 2 ends at 13:00, Slot 3 starts at 14:00)
-    const canLookAhead = s !== 2 && s + 1 < TIME_SLOTS.length;
-
-    if (canLookAhead) {
-      const nextSlot = TIME_SLOTS[s + 1];
-      const nextLessons = getLessonsForSlot(dayLessons, nextSlot.timeNum);
-
-      // Case A: 1 lesson in current slot, 1 in next slot with the same subject
-      if (
-        currentLessons.length === 1 &&
-        nextLessons.length === 1 &&
-        currentLessons[0].subjectName.trim().toLowerCase() === nextLessons[0].subjectName.trim().toLowerCase() &&
-        currentLessons[0].isCancelled === nextLessons[0].isCancelled
-      ) {
-        const l1 = currentLessons[0];
-        const l2 = nextLessons[0];
-
-        const mergedLesson: TimetableLesson = {
-          ...l1,
-          id: `${l1.id}_merged_${l2.id}`,
-          endTime: Math.max(l1.endTime, l2.endTime),
-          endTimeStr: l2.endTimeStr || l1.endTimeStr,
-          roomName: l1.roomName || l2.roomName,
-          roomLongName: l1.roomLongName || l2.roomLongName,
-          isHybrid: l1.isHybrid || l2.isHybrid,
-          teacherName: l1.teacherName || l2.teacherName,
-          teacherLongName: l1.teacherLongName || l2.teacherLongName,
-          substText: [l1.substText, l2.substText].filter(Boolean).join(' | ')
-        };
-
-        blocks.push({
-          key: `merged-${s}-${s + 1}`,
-          startRow: currentSlot.row,
-          rowSpan: 2,
-          isMerged: true,
-          lessons: [mergedLesson]
-        });
-
-        handledSlotIndices.add(s + 1);
-        continue;
+      // Assign each chain to the lowest conflict-free lane
+      for (const chain of cluster) {
+        chain.lane = -1;
       }
 
-      // Case B: 2 overlapping lessons that match pairwise with 2 in the next slot
-      if (
-        currentLessons.length === 2 &&
-        nextLessons.length === 2 &&
-        currentLessons[0].subjectName.trim().toLowerCase() === nextLessons[0].subjectName.trim().toLowerCase() &&
-        currentLessons[1].subjectName.trim().toLowerCase() === nextLessons[1].subjectName.trim().toLowerCase() &&
-        currentLessons[0].isCancelled === nextLessons[0].isCancelled &&
-        currentLessons[1].isCancelled === nextLessons[1].isCancelled
-      ) {
-        const mergedA: TimetableLesson = {
-          ...currentLessons[0],
-          id: `${currentLessons[0].id}_merged_${nextLessons[0].id}`,
-          endTime: Math.max(currentLessons[0].endTime, nextLessons[0].endTime),
-          endTimeStr: nextLessons[0].endTimeStr,
-          roomName: currentLessons[0].roomName || nextLessons[0].roomName,
-          isHybrid: currentLessons[0].isHybrid || nextLessons[0].isHybrid
-        };
-        const mergedB: TimetableLesson = {
-          ...currentLessons[1],
-          id: `${currentLessons[1].id}_merged_${nextLessons[1].id}`,
-          endTime: Math.max(currentLessons[1].endTime, nextLessons[1].endTime),
-          endTimeStr: nextLessons[1].endTimeStr,
-          roomName: currentLessons[1].roomName || nextLessons[1].roomName,
-          isHybrid: currentLessons[1].isHybrid || nextLessons[1].isHybrid
-        };
+      for (const chain of cluster) {
+        let lane = 0;
+        while (true) {
+          const hasConflict = cluster.some(other =>
+            other !== chain &&
+            other.lane === lane &&
+            Math.max(chain.startSlot, other.startSlot) <= Math.min(chain.endSlot, other.endSlot)
+          );
 
-        blocks.push({
-          key: `merged-${s}-${s + 1}`,
-          startRow: currentSlot.row,
-          rowSpan: 2,
-          isMerged: true,
-          lessons: [mergedA, mergedB]
-        });
+          if (!hasConflict) {
+            chain.lane = lane;
+            break;
+          }
+          lane++;
+        }
+      }
 
-        handledSlotIndices.add(s + 1);
-        continue;
+      const totalLanes = Math.max(...cluster.map(c => c.lane)) + 1;
+      const widthPct = 100 / totalLanes;
+
+      for (const chain of cluster) {
+        chain.totalLanes = totalLanes;
+        chain.widthPct = widthPct;
+        chain.leftPct = chain.lane * widthPct;
       }
     }
 
-    // Default: Single slot block (if multiple lessons, they sit side-by-side)
-    blocks.push({
-      key: `slot-${s}`,
-      startRow: currentSlot.row,
-      rowSpan: 1,
-      isMerged: false,
-      lessons: currentLessons
-    });
+    // Convert completed chains into DayGridCard objects
+    for (const chain of completedChains) {
+      const startSlotDef = TIME_SLOTS[chain.startSlot];
+      const endSlotDef = TIME_SLOTS[chain.endSlot];
+      const startRow = startSlotDef.row;
+      const endRow = endSlotDef.row;
+      const rowSpan = endRow - startRow + 1;
+      const isMerged = chain.lessons.length > 1;
+      const mergedLesson = mergeLessonChain(chain.lessons);
+
+      cards.push({
+        key: `card-${chain.startSlot}-${chain.endSlot}-${chain.lane}-${chain.subjectKey}`,
+        startRow,
+        rowSpan,
+        isMerged,
+        mergedCount: chain.lessons.length,
+        mergedLesson,
+        lane: chain.lane,
+        totalLanes: chain.totalLanes,
+        widthPct: chain.widthPct,
+        leftPct: chain.leftPct
+      });
+    }
   }
 
-  return blocks;
+  return cards;
 }
 
 interface TimetableDashboardProps {
@@ -325,12 +451,12 @@ export const TimetableDashboard: React.FC<TimetableDashboardProps> = ({
     });
   }, [lessons, todayStr]);
 
-  // Pre-compute grid blocks per day
-  const dayGridBlocks = useMemo(() => {
-    const map = new Map<string, DayBlock[]>();
+  // Pre-compute grid cards per day
+  const dayGridCards = useMemo(() => {
+    const map = new Map<string, DayGridCard[]>();
     for (const day of weekDays) {
       const dayLessons = filteredLessons.filter(l => l.dateStr === day.dateStr);
-      map.set(day.dateStr, computeDayGridBlocks(dayLessons));
+      map.set(day.dateStr, computeDayGridCards(dayLessons));
     }
     return map;
   }, [weekDays, filteredLessons]);
@@ -476,16 +602,16 @@ export const TimetableDashboard: React.FC<TimetableDashboardProps> = ({
         /* GRID VIEW (Montag bis Samstag, nebeneinander bei Überschneidung & verbundene 2x Blöcke) */
         <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 shadow-xs overflow-x-auto transition-colors">
           <div
-            className="grid min-w-[960px]"
+            className="grid min-w-[750px] md:min-w-[960px]"
             style={{
-              gridTemplateColumns: '76px repeat(6, minmax(140px, 1fr))',
-              gridTemplateRows: 'auto repeat(3, minmax(96px, auto)) minmax(40px, auto) repeat(4, minmax(96px, auto))'
+              gridTemplateColumns: '56px repeat(6, minmax(115px, 1fr))',
+              gridTemplateRows: 'auto repeat(3, minmax(104px, auto)) minmax(40px, auto) repeat(4, minmax(104px, auto))'
             }}
           >
             {/* 1. Header (Row 1): Zeit + 6 Wochentage (Mo - Sa) */}
             <div
               style={{ gridColumn: 1, gridRow: 1 }}
-              className="p-3 border-b border-r border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/60 text-center text-xs font-bold text-slate-400 dark:text-slate-500 flex items-center justify-center"
+              className="p-2 md:p-3 border-b border-r border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/60 text-center text-[11px] md:text-xs font-bold text-slate-400 dark:text-slate-500 flex items-center justify-center"
             >
               Zeit
             </div>
@@ -493,14 +619,14 @@ export const TimetableDashboard: React.FC<TimetableDashboardProps> = ({
               <div
                 key={day.dateStr}
                 style={{ gridColumn: dIdx + 2, gridRow: 1 }}
-                className={`p-3 text-center border-b border-r border-slate-200 dark:border-slate-800 last:border-r-0 ${
+                className={`p-2 md:p-3 text-center border-b border-r border-slate-200 dark:border-slate-800 last:border-r-0 ${
                   day.isToday
                     ? 'bg-blue-50/80 dark:bg-blue-950/60 text-blue-900 dark:text-blue-300 font-extrabold'
                     : 'bg-slate-50/70 dark:bg-slate-800/60 text-slate-700 dark:text-slate-300'
                 }`}
               >
-                <div className="text-sm font-bold">{day.dayName}</div>
-                <div className={`text-[11px] font-medium ${day.isToday ? 'text-blue-700 dark:text-blue-400' : 'text-slate-500 dark:text-slate-400'}`}>
+                <div className="text-xs md:text-sm font-bold">{day.dayName}</div>
+                <div className={`text-[10px] md:text-[11px] font-medium ${day.isToday ? 'text-blue-700 dark:text-blue-400' : 'text-slate-500 dark:text-slate-400'}`}>
                   {day.dayNumber}
                 </div>
               </div>
@@ -511,20 +637,20 @@ export const TimetableDashboard: React.FC<TimetableDashboardProps> = ({
               <div
                 key={slot.start}
                 style={{ gridColumn: 1, gridRow: slot.row }}
-                className="p-2 border-b border-r border-slate-200 dark:border-slate-800 bg-slate-50/40 dark:bg-slate-900/40 text-center flex flex-col justify-center"
+                className="p-1 md:p-2 border-b border-r border-slate-200 dark:border-slate-800 bg-slate-50/40 dark:bg-slate-900/40 text-center flex flex-col justify-center"
               >
-                <span className="text-xs font-bold text-slate-800 dark:text-slate-200">{slot.start}</span>
-                <span className="text-[10px] text-slate-400 dark:text-slate-500 font-medium">{slot.end}</span>
+                <span className="text-[11px] md:text-xs font-bold text-slate-800 dark:text-slate-200">{slot.start}</span>
+                <span className="text-[9px] md:text-[10px] text-slate-400 dark:text-slate-500 font-medium">{slot.end}</span>
               </div>
             ))}
 
             {/* Row 5 Col 1: Mittagspause Zeitlabel (13:00 - 14:00) */}
             <div
               style={{ gridColumn: 1, gridRow: 5 }}
-              className="p-2 border-b border-r border-slate-200 dark:border-slate-800 bg-slate-50/40 dark:bg-slate-900/40 text-center flex flex-col justify-center"
+              className="p-1 md:p-2 border-b border-r border-slate-200 dark:border-slate-800 bg-slate-50/40 dark:bg-slate-900/40 text-center flex flex-col justify-center"
             >
-              <span className="text-xs font-bold text-slate-800 dark:text-slate-200">13:00</span>
-              <span className="text-[10px] text-slate-400 dark:text-slate-500 font-medium">14:00</span>
+              <span className="text-[11px] md:text-xs font-bold text-slate-800 dark:text-slate-200">13:00</span>
+              <span className="text-[9px] md:text-[10px] text-slate-400 dark:text-slate-500 font-medium">14:00</span>
             </div>
 
             {/* Row 5 Cols 2-7: Mittagspause Block (neutral ohne besondere Hervorhebung) */}
@@ -541,89 +667,93 @@ export const TimetableDashboard: React.FC<TimetableDashboardProps> = ({
               <div
                 key={slot.start}
                 style={{ gridColumn: 1, gridRow: slot.row }}
-                className="p-2 border-b border-r border-slate-200 dark:border-slate-800 bg-slate-50/40 dark:bg-slate-900/40 text-center flex flex-col justify-center"
+                className="p-1 md:p-2 border-b border-r border-slate-200 dark:border-slate-800 bg-slate-50/40 dark:bg-slate-900/40 text-center flex flex-col justify-center"
               >
-                <span className="text-xs font-bold text-slate-800 dark:text-slate-200">{slot.start}</span>
-                <span className="text-[10px] text-slate-400 dark:text-slate-500 font-medium">{slot.end}</span>
+                <span className="text-[11px] md:text-xs font-bold text-slate-800 dark:text-slate-200">{slot.start}</span>
+                <span className="text-[9px] md:text-[10px] text-slate-400 dark:text-slate-500 font-medium">{slot.end}</span>
               </div>
             ))}
 
             {/* 3. Vorlesungsblöcke je Tag (Spalten 2 bis 7: Mo, Di, Mi, Do, Fr, Sa) */}
             {weekDays.map((day, dIdx) => {
-              const blocks = dayGridBlocks.get(day.dateStr) || [];
+              const cards = dayGridCards.get(day.dateStr) || [];
               const col = dIdx + 2;
               const isLastCol = dIdx === 5;
 
-              return blocks.map(block => {
-                if (block.lessons.length === 0) {
-                  return (
+              return (
+                <React.Fragment key={day.dateStr}>
+                  {/* Background slots for all 7 periods in this day column */}
+                  {TIME_SLOTS.map(slot => (
                     <div
-                      key={`${day.dateStr}-${block.key}`}
+                      key={`bg-${day.dateStr}-${slot.index}`}
                       style={{
                         gridColumn: col,
-                        gridRow: `${block.startRow} / span ${block.rowSpan}`
+                        gridRow: slot.row
                       }}
-                      className={`p-1.5 border-b ${!isLastCol ? 'border-r' : ''} border-slate-100 dark:border-slate-800/80 transition-colors ${
+                      className={`border-b ${!isLastCol ? 'border-r' : ''} border-slate-100 dark:border-slate-800/80 transition-colors ${
                         day.isToday ? 'bg-blue-50/10 dark:bg-blue-950/15' : 'hover:bg-slate-50/30 dark:hover:bg-slate-800/30'
                       }`}
                     />
-                  );
-                }
+                  ))}
 
-                return (
-                  <div
-                    key={`${day.dateStr}-${block.key}`}
-                    style={{
-                      gridColumn: col,
-                      gridRow: `${block.startRow} / span ${block.rowSpan}`
-                    }}
-                    className={`p-1.5 border-b ${!isLastCol ? 'border-r' : ''} border-slate-100 dark:border-slate-800/80 transition-colors flex flex-row gap-1.5 h-full w-full ${
-                      day.isToday ? 'bg-blue-50/15 dark:bg-blue-950/20' : 'hover:bg-slate-50/40 dark:hover:bg-slate-800/30'
-                    }`}
-                  >
-                    {/* Render overlapping lessons side-by-side */}
-                    {block.lessons.map(lesson => {
-                      const roomFormat = getLessonRoomFormat(lesson);
-                      return (
+                  {/* Render positioned cards (single or arbitrary multi-slot merged blocks) */}
+                  {cards.map(card => {
+                    const roomFormat = getLessonRoomFormat(card.mergedLesson);
+                    const isMultiLane = card.totalLanes > 1;
+
+                    return (
+                      <div
+                        key={`${day.dateStr}-${card.key}`}
+                        style={{
+                          gridColumn: col,
+                          gridRow: `${card.startRow} / span ${card.rowSpan}`,
+                          width: card.totalLanes === 1 ? '100%' : `calc(${card.widthPct}% - 2px)`,
+                          marginLeft: card.totalLanes === 1 ? '0' : `calc(${card.leftPct}% + ${card.lane > 0 ? 2 : 0}px)`,
+                          justifySelf: 'start',
+                          zIndex: 10
+                        }}
+                        className="p-1 sm:p-1.5 h-full pointer-events-auto"
+                      >
                         <div
-                          key={lesson.id}
-                          onClick={() => setSelectedLesson(lesson)}
-                          style={{ borderLeftColor: lesson.subjectColor || '#3b82f6' }}
-                          className={`flex-1 min-w-0 p-2 rounded-md border-l-4 text-left shadow-2xs transition-all hover:scale-[1.01] cursor-pointer flex flex-col justify-between ${
-                            lesson.isCancelled
+                          onClick={() => setSelectedLesson(card.mergedLesson)}
+                          style={{ borderLeftColor: card.mergedLesson.subjectColor || '#3b82f6' }}
+                          className={`h-full w-full min-w-0 p-1.5 sm:p-2 rounded-md border-l-[3px] sm:border-l-4 text-left shadow-2xs transition-all hover:scale-[1.01] cursor-pointer flex flex-col justify-between overflow-hidden ${
+                            card.mergedLesson.isCancelled
                               ? 'bg-rose-50 dark:bg-rose-950/50 border-rose-400 dark:border-rose-800 opacity-75'
                               : 'bg-white dark:bg-slate-800/95 border border-slate-200 dark:border-slate-700 hover:shadow-md'
                           }`}
                         >
-                          {/* Top: Title & Merged/Ausfall Badges */}
-                          <div>
-                            <div className="flex items-start justify-between gap-1">
+                          {/* Top: Title & Badges */}
+                          <div className="min-w-0">
+                            <div className="flex items-start justify-between gap-0.5">
                               <span
-                                title={lesson.subjectLongName || lesson.subjectName}
-                                className={`font-bold text-xs leading-tight line-clamp-2 ${
-                                  lesson.isCancelled
+                                title={card.mergedLesson.subjectLongName || card.mergedLesson.subjectName}
+                                className={`font-bold leading-tight line-clamp-2 break-words ${
+                                  isMultiLane ? 'text-[10px] sm:text-xs' : 'text-[11px] sm:text-xs'
+                                } ${
+                                  card.mergedLesson.isCancelled
                                     ? 'line-through text-rose-800 dark:text-rose-300'
                                     : 'text-slate-900 dark:text-slate-100'
                                 }`}
                               >
-                                {lesson.subjectName}
+                                {card.mergedLesson.subjectName}
                               </span>
-                              <div className="flex items-center space-x-1 shrink-0">
-                                {block.isMerged && (
+                              <div className="flex items-center space-x-0.5 shrink-0">
+                                {card.isMerged && (
                                   <span
-                                    title="Verbundene Doppelstunde (2 Blöcke)"
-                                    className="bg-blue-100 dark:bg-blue-950 text-blue-700 dark:text-blue-300 text-[9px] font-extrabold px-1 rounded"
+                                    title={`Verbundene Vorlesung (${card.mergedCount} Blöcke)`}
+                                    className="bg-blue-100 dark:bg-blue-950 text-blue-700 dark:text-blue-300 text-[8px] sm:text-[9px] font-extrabold px-0.5 sm:px-1 rounded"
                                   >
-                                    2x
+                                    {card.mergedCount}x
                                   </span>
                                 )}
-                                {lesson.isCancelled && (
-                                  <span className="bg-rose-100 dark:bg-rose-950 text-rose-700 dark:text-rose-300 text-[9px] font-extrabold px-1 rounded">
+                                {card.mergedLesson.isCancelled && (
+                                  <span className="bg-rose-100 dark:bg-rose-950 text-rose-700 dark:text-rose-300 text-[8px] sm:text-[9px] font-extrabold px-0.5 sm:px-1 rounded">
                                     Ausfall
                                   </span>
                                 )}
-                                {lesson.isSubstitution && (
-                                  <span className="bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300 text-[9px] font-bold px-1 rounded">
+                                {card.mergedLesson.isSubstitution && (
+                                  <span className="bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300 text-[8px] sm:text-[9px] font-bold px-0.5 sm:px-1 rounded">
                                     Vertr.
                                   </span>
                                 )}
@@ -631,9 +761,11 @@ export const TimetableDashboard: React.FC<TimetableDashboardProps> = ({
                             </div>
 
                             {/* Time & Room display */}
-                            <div className="mt-1 flex items-center justify-between gap-1 text-[10px] flex-wrap">
-                              <span className="font-semibold text-slate-700 dark:text-slate-300 whitespace-nowrap">
-                                {lesson.startTimeStr} - {lesson.endTimeStr}
+                            <div className={`mt-0.5 sm:mt-1 flex gap-0.5 text-[9px] sm:text-[10px] leading-tight ${
+                              isMultiLane ? 'flex-col items-start' : 'items-center justify-between flex-wrap'
+                            }`}>
+                              <span className="font-semibold text-slate-700 dark:text-slate-300 whitespace-nowrap text-[9px] sm:text-[10px]">
+                                {card.mergedLesson.startTimeStr} - {card.mergedLesson.endTimeStr}
                               </span>
                               <span
                                 title={
@@ -643,7 +775,7 @@ export const TimetableDashboard: React.FC<TimetableDashboardProps> = ({
                                     ? 'Hybrid: Raum + Online'
                                     : 'Online'
                                 }
-                                className={`px-1.5 py-0.2 rounded text-[10px] ${roomFormat.badgeClasses}`}
+                                className={`px-1 py-0.2 rounded text-[8px] sm:text-[9px] font-medium truncate max-w-full ${roomFormat.badgeClasses}`}
                               >
                                 {roomFormat.displayText}
                               </span>
@@ -651,65 +783,63 @@ export const TimetableDashboard: React.FC<TimetableDashboardProps> = ({
                           </div>
 
                           {/* Bottom: Class & Teacher */}
-                          <div className="mt-1.5 pt-1 border-t border-slate-100 dark:border-slate-700/60 flex items-center justify-between text-[10px] text-slate-500 dark:text-slate-400">
-                            <span className="bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 px-1 rounded font-medium truncate max-w-[65px] border border-blue-200/50 dark:border-blue-900/50">
-                              {lesson.className}
+                          <div className="mt-1 pt-0.5 sm:pt-1 border-t border-slate-100 dark:border-slate-700/60 flex items-center justify-between gap-1 text-[8px] sm:text-[9px] text-slate-500 dark:text-slate-400">
+                            <span className="bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 px-1 rounded font-medium truncate max-w-[50px] sm:max-w-[65px] border border-blue-200/50 dark:border-blue-900/50">
+                              {card.mergedLesson.className}
                             </span>
-                            {lesson.teacherName && (
-                              <span className="truncate max-w-[70px] text-slate-500 dark:text-slate-400">
-                                {lesson.teacherName}
+                            {card.mergedLesson.teacherName && (
+                              <span className="truncate max-w-[50px] sm:max-w-[70px] text-slate-500 dark:text-slate-400">
+                                {card.mergedLesson.teacherName}
                               </span>
                             )}
                           </div>
                         </div>
-                      );
-                    })}
-                  </div>
-                );
-              });
+                      </div>
+                    );
+                  })}
+                </React.Fragment>
+              );
             })}
           </div>
         </div>
       ) : (
-        /* LIST VIEW (Day by Day with 2x merged subjects & room format) */
+        /* LIST VIEW (Day by Day with multi-block merged subjects & room format) */
         <div className="space-y-4">
           {weekDays.map(day => {
             const dayLessons = filteredLessons.filter(l => l.dateStr === day.dateStr);
 
             // Group consecutive lessons in list view as well (excluding crossing lunch break)
-            const groupedListLessons: Array<{ lesson: TimetableLesson; isMerged: boolean }> = [];
+            const groupedListLessons: Array<{ lesson: TimetableLesson; isMerged: boolean; count: number }> = [];
             let i = 0;
             while (i < dayLessons.length) {
-              const cur = dayLessons[i];
-              const next = dayLessons[i + 1];
-
-              const canMerge =
-                next &&
-                cur.subjectName.trim().toLowerCase() === next.subjectName.trim().toLowerCase() &&
-                cur.isCancelled === next.isCancelled &&
+              const currentGroup = [dayLessons[i]];
+              let j = i + 1;
+              while (j < dayLessons.length) {
+                const prev = dayLessons[j - 1];
+                const next = dayLessons[j];
+                const isSameSubject = prev.subjectName.trim().toLowerCase() === next.subjectName.trim().toLowerCase();
+                const isSameStatus = prev.isCancelled === next.isCancelled;
                 // Do not merge across lunch break (13:00 - 14:00)
-                !(cur.endTime <= 1300 && next.startTime >= 1350);
+                const crossesLunch = (prev.endTime <= 1300 && next.startTime >= 1350);
+                const prevEndMin = timeNumToMinutes(prev.endTime);
+                const nextStartMin = timeNumToMinutes(next.startTime);
+                const isAdjacent = nextStartMin >= prevEndMin && (nextStartMin - prevEndMin <= 30);
 
-              if (canMerge) {
-                groupedListLessons.push({
-                  lesson: {
-                    ...cur,
-                    id: `${cur.id}_merged_${next.id}`,
-                    endTime: Math.max(cur.endTime, next.endTime),
-                    endTimeStr: next.endTimeStr || cur.endTimeStr,
-                    roomName: cur.roomName || next.roomName,
-                    roomLongName: cur.roomLongName || next.roomLongName,
-                    isHybrid: cur.isHybrid || next.isHybrid,
-                    teacherName: cur.teacherName || next.teacherName,
-                    substText: [cur.substText, next.substText].filter(Boolean).join(' | ')
-                  },
-                  isMerged: true
-                });
-                i += 2;
-              } else {
-                groupedListLessons.push({ lesson: cur, isMerged: false });
-                i++;
+                if (isSameSubject && isSameStatus && !crossesLunch && isAdjacent) {
+                  currentGroup.push(next);
+                  j++;
+                } else {
+                  break;
+                }
               }
+
+              const merged = mergeLessonChain(currentGroup);
+              groupedListLessons.push({
+                lesson: merged,
+                isMerged: currentGroup.length > 1,
+                count: currentGroup.length
+              });
+              i = j;
             }
 
             return (
@@ -734,7 +864,7 @@ export const TimetableDashboard: React.FC<TimetableDashboardProps> = ({
                   {groupedListLessons.length === 0 ? (
                     <p className="text-xs text-slate-400 dark:text-slate-500 py-3 text-center italic">Keine Vorlesungen an diesem Tag</p>
                   ) : (
-                    groupedListLessons.map(({ lesson, isMerged }) => {
+                    groupedListLessons.map(({ lesson, isMerged, count }) => {
                       const roomFormat = getLessonRoomFormat(lesson);
                       return (
                         <div
@@ -754,7 +884,7 @@ export const TimetableDashboard: React.FC<TimetableDashboardProps> = ({
                                 </h4>
                                 {isMerged && (
                                   <span className="bg-blue-100 dark:bg-blue-950 text-blue-700 dark:text-blue-300 text-xs px-2 py-0.2 rounded font-extrabold">
-                                    2 Blöcke
+                                    {count} Blöcke
                                   </span>
                                 )}
                                 {lesson.isCancelled && (

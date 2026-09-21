@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2563eb" />
+      <stop offset="100%" stop-color="#1d4ed8" />
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-opacity="0.25" />
+    </filter>
+  </defs>
+
+  <!-- Background container -->
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#bgGrad)" />
+
+  <!-- Calendar Header Bar -->
+  <rect x="8" y="8" width="48" height="12" rx="4" fill="#1e40af" />
+  
+  <!-- Spiral / Rings -->
+  <rect x="16" y="5" width="4" height="6" rx="2" fill="#93c5fd" />
+  <rect x="30" y="5" width="4" height="6" rx="2" fill="#93c5fd" />
+  <rect x="44" y="5" width="4" height="6" rx="2" fill="#93c5fd" />
+
+  <!-- Calendar Main Sheet -->
+  <rect x="8" y="22" width="48" height="34" rx="4" fill="#ffffff" />
+
+  <!-- Timetable Grid Blocks -->
+  <!-- Block 1: Multi-hour merged block (left lane, 2 slots) -->
+  <rect x="12" y="26" width="18" height="18" rx="2.5" fill="#3b82f6" />
+  <rect x="14" y="29" width="10" height="2" rx="1" fill="#ffffff" opacity="0.9" />
+  <rect x="14" y="33" width="14" height="2" rx="1" fill="#bfdbfe" />
+
+  <!-- Block 2: Single slot (right lane) -->
+  <rect x="34" y="26" width="18" height="8" rx="2" fill="#10b981" />
+  <rect x="36" y="29" width="12" height="2" rx="1" fill="#ffffff" opacity="0.9" />
+
+  <!-- Block 3: Afternoon block (right lane) -->
+  <rect x="34" y="36" width="18" height="8" rx="2" fill="#8b5cf6" />
+  <rect x="36" y="39" width="10" height="2" rx="1" fill="#ffffff" opacity="0.9" />
+
+  <!-- Block 4: Bottom wide merged block -->
+  <rect x="12" y="46" width="40" height="7" rx="2" fill="#f59e0b" />
+  <rect x="15" y="48.5" width="16" height="2" rx="1" fill="#ffffff" opacity="0.9" />
+</svg>

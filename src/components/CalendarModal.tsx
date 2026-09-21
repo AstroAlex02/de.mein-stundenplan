@@ -230,9 +230,14 @@ export const CalendarModal: React.FC<CalendarModalProps> = ({
                 </p>
               )}
               {activeGuideTab === 'google' && (
-                <p className="text-[10px] text-slate-500 dark:text-slate-400 leading-normal">
-                  <strong>Google Kalender (Android / Web):</strong> Öffne <em>calendar.google.com</em> am PC oder Browser, klicke links neben <em>&quot;Weitere Kalender&quot;</em> auf das <strong>+</strong> &gt; <em>&quot;Per URL hinzufügen&quot;</em> und füge die kopierte URL ein.
-                </p>
+                <div className="space-y-1 text-[10px] text-slate-500 dark:text-slate-400 leading-normal">
+                  <p>
+                    <strong>Google Kalender (Android / Web):</strong> Öffne <em>calendar.google.com</em> im Browser, klicke links neben <em>&quot;Weitere Kalender&quot;</em> auf das <strong>+</strong> &gt; <em>&quot;Per URL hinzufügen&quot;</em> und füge die URL ein.
+                  </p>
+                  <p className="text-amber-700 dark:text-amber-300/90 text-[9.5px] bg-amber-50 dark:bg-amber-950/40 p-1.5 rounded border border-amber-200/60 dark:border-amber-900/40">
+                    ℹ️ <strong>Hinweis zur Aktualisierung:</strong> Google Kalender ruft externe Webcal-URLs in eigenen Server-Intervallen ab (meist alle paar Stunden). Auf unserem Server werden Änderungen bei jedem stündlichen Sync und bei jeder Fach-Auswahl sofort bereitgestellt.
+                  </p>
+                </div>
               )}
               {activeGuideTab === 'outlook' && (
                 <p className="text-[10px] text-slate-500 dark:text-slate-400 leading-normal">

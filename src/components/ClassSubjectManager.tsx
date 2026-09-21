@@ -168,38 +168,39 @@ export const ClassSubjectManager: React.FC<ClassSubjectManagerProps> = ({
     }, 400); // 400ms debounce
   };
 
-  // Instant toggle for catalog classes (0ms UI latency, no reselection loop)
+  // Instant toggle for catalog classes (functional state to prevent stale closures during rapid clicks)
   const toggleClassSelection = (cls: SelectedClass) => {
-    const isAlreadySelected = selectedClasses.some(
-      c => c.id === cls.id || c.name.toLowerCase() === cls.name.toLowerCase()
-    );
-    let next: SelectedClass[];
-    if (isAlreadySelected) {
-      next = selectedClasses.filter(
-        c => c.id !== cls.id && c.name.toLowerCase() !== cls.name.toLowerCase()
+    setSelectedClasses(prev => {
+      const isAlreadySelected = prev.some(
+        c => c.id === cls.id || c.name.toLowerCase() === cls.name.toLowerCase()
       );
-    } else {
-      next = [...selectedClasses, cls];
-    }
-    setSelectedClasses(next);
-    scheduleAutoSave(next);
+      const next = isAlreadySelected
+        ? prev.filter(c => c.id !== cls.id && c.name.toLowerCase() !== cls.name.toLowerCase())
+        : [...prev, cls];
+      scheduleAutoSave(next);
+      return next;
+    });
   };
 
   // Add a class
   const addClass = (cls: SelectedClass) => {
-    if (selectedClasses.some(c => c.id === cls.id || c.name.toLowerCase() === cls.name.toLowerCase())) {
-      return;
-    }
-    const nextClasses = [...selectedClasses, cls];
-    setSelectedClasses(nextClasses);
-    scheduleAutoSave(nextClasses);
+    setSelectedClasses(prev => {
+      if (prev.some(c => c.id === cls.id || c.name.toLowerCase() === cls.name.toLowerCase())) {
+        return prev;
+      }
+      const next = [...prev, cls];
+      scheduleAutoSave(next);
+      return next;
+    });
   };
 
   // Remove a class
   const removeClass = (id: number) => {
-    const nextClasses = selectedClasses.filter(c => c.id !== id);
-    setSelectedClasses(nextClasses);
-    scheduleAutoSave(nextClasses);
+    setSelectedClasses(prev => {
+      const next = prev.filter(c => c.id !== id);
+      scheduleAutoSave(next);
+      return next;
+    });
   };
 
   // Add custom class

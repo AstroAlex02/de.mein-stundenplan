@@ -828,20 +828,32 @@ async function startServer() {
 
       const user = getUserById(row.user_id);
       const timetable = getUserTimetable(row.user_id);
-      const ics = generateIcsCalendar(timetable.lessons, `Stundenplan - ${user?.displayName || 'Mein-Stundenplan'}`);
+
+      const lastModifiedDate = row.updated_at ? new Date(row.updated_at) : new Date();
+      // Calculate a stable sequence number based on updated_at timestamp (in minutes) so clients detect changes
+      const sequence = Math.floor(lastModifiedDate.getTime() / 60000);
+
+      const ics = generateIcsCalendar(
+        timetable.lessons,
+        `Stundenplan - ${user?.displayName || 'Mein-Stundenplan'}`,
+        { sequence, lastModified: lastModifiedDate }
+      );
+
+      // Create ETag from user settings updated_at and lesson count
+      const etag = `W/"${lastModifiedDate.getTime()}-${timetable.lessons.length}"`;
 
       // Essential headers for Apple Calendar, Google Calendar, Outlook, Thunderbird
       res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
       res.setHeader('Cache-Control', 'no-cache, no-store, max-age=0, must-revalidate');
       res.setHeader('Pragma', 'no-cache');
       res.setHeader('Expires', '0');
+      res.setHeader('ETag', etag);
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
       res.setHeader('Content-Disposition', `inline; filename="stundenplan_${user?.username || 'feed'}.ics"`);
 
       if (row.updated_at) {
-        const lastMod = new Date(row.updated_at).toUTCString();
-        res.setHeader('Last-Modified', lastMod);
+        res.setHeader('Last-Modified', lastModifiedDate.toUTCString());
       }
 
       if (req.method === 'HEAD') {

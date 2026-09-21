@@ -456,6 +456,26 @@ export async function syncTimetables(options: { forceUserId?: number; fullSemest
     `Sync completed in ${Date.now() - startTime}ms`
   );
 
+  // Bump user_settings updated_at so calendar feeds immediately recognize changes
+  try {
+    const subscriberUserIds = new Set<number>();
+    for (const subs of classSubscribers.values()) {
+      for (const s of subs) {
+        subscriberUserIds.add(s.userId);
+      }
+    }
+    if (subscriberUserIds.size > 0) {
+      const userPlaceholders = Array.from(subscriberUserIds).map(() => '?').join(',');
+      db.prepare(`
+        UPDATE user_settings
+        SET updated_at = CURRENT_TIMESTAMP
+        WHERE user_id IN (${userPlaceholders})
+      `).run(...Array.from(subscriberUserIds));
+    }
+  } catch (err: any) {
+    console.warn('[Sync] Could not update calendar feed timestamp for users:', err.message);
+  }
+
   console.log(`[Sync] Finished. Tracked ${totalPeriods} periods across ${datesToSync.length} weeks, ${changesDetected} changes detected.`);
   return {
     classesCount: classSubscribers.size,
@@ -758,7 +778,15 @@ function escapeIcsText(str: string): string {
 }
 
 // Generate RFC 5545 iCal / .ics file content
-export function generateIcsCalendar(lessons: TimetableLesson[], calendarName = 'Mein-Stundenplan'): string {
+export function generateIcsCalendar(
+  lessons: TimetableLesson[],
+  calendarName = 'Mein-Stundenplan',
+  options: { sequence?: number; lastModified?: Date } = {}
+): string {
+  const lastModDate = options.lastModified || new Date();
+  const dtStampNow = lastModDate.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+  const sequenceNum = Math.max(0, options.sequence ?? 0);
+
   const lines: string[] = [
     'BEGIN:VCALENDAR',
     'VERSION:2.0',
@@ -789,14 +817,69 @@ export function generateIcsCalendar(lessons: TimetableLesson[], calendarName = '
     'END:VTIMEZONE'
   ];
 
-  for (const lesson of lessons) {
+  // Group consecutive lessons of the same subject on the same day (no merge across lunch break 13:00 - 14:00)
+  const sortedLessons = [...lessons].sort((a, b) => {
+    if (a.date !== b.date) return a.date - b.date;
+    return a.startTime - b.startTime;
+  });
+
+  const mergedEvents: TimetableLesson[] = [];
+  let i = 0;
+  while (i < sortedLessons.length) {
+    const cur = sortedLessons[i];
+    const group = [cur];
+    let j = i + 1;
+    while (j < sortedLessons.length) {
+      const prev = sortedLessons[j - 1];
+      const next = sortedLessons[j];
+      if (
+        next.date === cur.date &&
+        next.subjectName.trim().toLowerCase() === cur.subjectName.trim().toLowerCase() &&
+        next.isCancelled === cur.isCancelled &&
+        !(prev.endTime <= 1300 && next.startTime >= 1350)
+      ) {
+        const prevEndMin = Math.floor(prev.endTime / 100) * 60 + (prev.endTime % 100);
+        const nextStartMin = Math.floor(next.startTime / 100) * 60 + (next.startTime % 100);
+        if (nextStartMin >= prevEndMin && nextStartMin - prevEndMin <= 30) {
+          group.push(next);
+          j++;
+          continue;
+        }
+      }
+      break;
+    }
+
+    if (group.length === 1) {
+      mergedEvents.push(cur);
+    } else {
+      const first = group[0];
+      const last = group[group.length - 1];
+      const physicalRoom = group.find(l => {
+        const r = (l.roomName || '').trim();
+        return r && r !== '-' && r !== '—' && r.toLowerCase() !== 'kein raum';
+      });
+      mergedEvents.push({
+        ...first,
+        id: `${first.id}_${group.length}x_${last.id}`,
+        endTime: Math.max(...group.map(l => l.endTime)),
+        endTimeStr: last.endTimeStr || first.endTimeStr,
+        roomName: physicalRoom ? physicalRoom.roomName : (first.roomName || last.roomName),
+        roomLongName: physicalRoom ? physicalRoom.roomLongName : (first.roomLongName || last.roomLongName),
+        isHybrid: group.some(l => l.isHybrid),
+        teacherName: group.map(l => l.teacherName).find(Boolean) || first.teacherName
+      });
+    }
+    i = j;
+  }
+
+  for (const lesson of mergedEvents) {
     const dateStr = lesson.date.toString();
     const startTimeStr = lesson.startTime.toString().padStart(4, '0');
     const endTimeStr = lesson.endTime.toString().padStart(4, '0');
 
     const dtStart = `${dateStr}T${startTimeStr}00`;
     const dtEnd = `${dateStr}T${endTimeStr}00`;
-    const dtStamp = `${dateStr}T000000Z`;
+    const dtStamp = dtStampNow;
     const uid = `lesson-${lesson.id}-${lesson.classId}-${dateStr}@stundenplan-manager`;
 
     let summary = lesson.subjectName;
@@ -828,6 +911,8 @@ export function generateIcsCalendar(lessons: TimetableLesson[], calendarName = '
         'BEGIN:VEVENT',
         `UID:${uid}`,
         `DTSTAMP:${dtStamp}`,
+        `LAST-MODIFIED:${dtStamp}`,
+        `SEQUENCE:${sequenceNum}`,
         `DTSTART;TZID=Europe/Berlin:${dtStart}`,
         `DTEND;TZID=Europe/Berlin:${dtEnd}`,
         `SUMMARY:${escapeIcsText(`[ENTFÄLLT] ${summary}`)}`,
@@ -843,6 +928,8 @@ export function generateIcsCalendar(lessons: TimetableLesson[], calendarName = '
       'BEGIN:VEVENT',
       `UID:${uid}`,
       `DTSTAMP:${dtStamp}`,
+      `LAST-MODIFIED:${dtStamp}`,
+      `SEQUENCE:${sequenceNum}`,
       `DTSTART;TZID=Europe/Berlin:${dtStart}`,
       `DTEND;TZID=Europe/Berlin:${dtEnd}`,
       `SUMMARY:${escapeIcsText(summary)}`,
