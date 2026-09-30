@@ -1,0 +1,1214 @@
+import { db, addNotification, getUserSettings } from './db.js';
+import { SelectedClass, TimetableLesson, UntisElement } from '../src/types.js';
+
+interface WebUntisPageConfigResponse {
+  data?: {
+    elements?: Array<{
+      type: number;
+      id: number;
+      name: string;
+      longName?: string;
+      displayname?: string;
+    }>;
+  };
+}
+
+interface WebUntisTimetableResponse {
+  data?: {
+    result?: {
+      data?: {
+        elementPeriods?: Record<string, Array<{
+          id: number;
+          lessonId: number;
+          lessonNumber?: number;
+          lessonCode?: string;
+          lessonText?: string;
+          periodText?: string;
+          substText?: string;
+          date: number; // e.g. 20261012
+          startTime: number; // e.g. 1400
+          endTime: number; // e.g. 1530
+          elements: Array<{
+            type: number; // 1: class, 2: teacher, 3: subject, 4: room
+            id: number;
+            orgId?: number;
+            missing?: boolean;
+            state?: string;
+          }>;
+          cellState?: string;
+        }>>;
+        elements?: UntisElement[];
+      };
+    };
+  };
+}
+
+// Convert Untis time integer e.g. 800 -> "08:00", 1430 -> "14:30"
+export function formatUntisTime(timeNum: number): string {
+  const str = timeNum.toString().padStart(4, '0');
+  return `${str.slice(0, 2)}:${str.slice(2, 4)}`;
+}
+
+// Convert Untis date integer e.g. 20261012 -> "2026-10-12"
+export function formatUntisDate(dateNum: number): string {
+  const str = dateNum.toString();
+  if (str.length !== 8) return str;
+  return `${str.slice(0, 4)}-${str.slice(4, 6)}-${str.slice(6, 8)}`;
+}
+
+// Fetch available classes from WebUntis
+export async function fetchWebUntisClasses(
+  schoolName = 'hs-albstadt',
+  serverUrl = 'https://hs-albstadt.webuntis.com',
+  targetDate?: string
+): Promise<SelectedClass[]> {
+  const dateStr = targetDate || new Date().toISOString().split('T')[0];
+  const url = `${serverUrl.replace(/\/+$/, '')}/WebUntis/api/public/timetable/weekly/pageconfig?type=1&date=${dateStr}`;
+
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'WebUntisStundenplanManager/1.0'
+      }
+    });
+
+    if (!res.ok) {
+      throw new Error(`WebUntis returned HTTP ${res.status}`);
+    }
+
+    const data = await res.json() as WebUntisPageConfigResponse;
+    const elements = data.data?.elements || [];
+
+    const classes: SelectedClass[] = elements.map(e => ({
+      id: e.id,
+      name: e.name,
+      longName: e.longName || e.name,
+      displayName: e.displayname || e.name
+    }));
+
+    // If few classes are returned for the current date (e.g. semester break),
+    // probe semester dates (October or April) to get a full catalog of classes
+    if (classes.length < 10) {
+      const semesterDates = ['2026-10-15', '2026-04-15', '2025-10-15'];
+      for (const sDate of semesterDates) {
+        if (sDate === dateStr) continue;
+        try {
+          const sRes = await fetch(`${serverUrl.replace(/\/+$/, '')}/WebUntis/api/public/timetable/weekly/pageconfig?type=1&date=${sDate}`, {
+            headers: { 'Accept': 'application/json' }
+          });
+          if (sRes.ok) {
+            const sData = await sRes.json() as WebUntisPageConfigResponse;
+            const moreElements = sData.data?.elements || [];
+            if (moreElements.length > classes.length) {
+              const seen = new Set(classes.map(c => c.id));
+              for (const me of moreElements) {
+                if (!seen.has(me.id)) {
+                  classes.push({
+                    id: me.id,
+                    name: me.name,
+                    longName: me.longName || me.name,
+                    displayName: me.displayname || me.name
+                  });
+                  seen.add(me.id);
+                }
+              }
+            }
+          }
+        } catch (e) {
+          // continue
+        }
+      }
+    }
+
+    classes.sort((a, b) => a.name.localeCompare(b.name, 'de', { numeric: true }));
+    return classes;
+  } catch (err: any) {
+    console.error('[WebUntis] Error fetching classes:', err.message);
+    throw err;
+  }
+}
+
+// Fetch timetable for a single class and date
+export async function fetchWebUntisTimetable(
+  schoolName: string,
+  serverUrl: string,
+  classId: number,
+  dateStr: string
+): Promise<{ periods: any[]; elements: Map<string, UntisElement> }> {
+  const url = `${serverUrl.replace(/\/+$/, '')}/WebUntis/api/public/timetable/weekly/data?elementType=1&elementId=${classId}&date=${dateStr}&formatId=5`;
+
+  const res = await fetch(url, {
+    headers: {
+      'Accept': 'application/json',
+      'User-Agent': 'WebUntisStundenplanManager/1.0'
+    },
+    signal: AbortSignal.timeout(15000)
+  });
+
+  if (!res.ok) {
+    throw new Error(`WebUntis data error: HTTP ${res.status}`);
+  }
+
+  const json = await res.json() as WebUntisTimetableResponse;
+  const rawPeriods = json.data?.result?.data?.elementPeriods?.[classId.toString()] || [];
+  const rawElements = json.data?.result?.data?.elements || [];
+
+  const elementMap = new Map<string, UntisElement>();
+  for (const el of rawElements) {
+    elementMap.set(`${el.type}:${el.id}`, el);
+  }
+
+  return { periods: rawPeriods, elements: elementMap };
+}
+
+// Calculate complete semester range and weekly Monday dates
+export interface SemesterPeriodInfo {
+  semName: string;
+  startDate: string;
+  endDate: string;
+  weekCount: number;
+  weekDates: string[];
+}
+
+export function getSemesterPeriodInfo(ref: Date = new Date()): SemesterPeriodInfo {
+  const year = ref.getFullYear();
+  const month = ref.getMonth(); // 0-11: 0=Jan, 1=Feb, 2=Mar, 8=Sep, 9=Oct, 11=Dec
+
+  let semName = '';
+  let start: Date;
+  let end: Date;
+
+  if (month >= 8 || month <= 1) {
+    // Wintersemester (WiSe): typically late September through February
+    const startYear = month >= 8 ? year : year - 1;
+    const endYear = startYear + 1;
+    semName = `Wintersemester ${startYear}/${(endYear % 100).toString().padStart(2, '0')}`;
+    start = new Date(Date.UTC(startYear, 8, 21)); // Sep 21
+    end = new Date(Date.UTC(endYear, 1, 28)); // Feb 28
+  } else {
+    // Sommersemester (SoSe): typically mid March through July/August
+    semName = `Sommersemester ${year}`;
+    start = new Date(Date.UTC(year, 2, 9)); // Mar 9
+    end = new Date(Date.UTC(year, 6, 31)); // Jul 31
+  }
+
+  // Snap start date to preceding Monday
+  const day = start.getUTCDay();
+  const diffToMonday = (day === 0 ? -6 : 1) - day;
+  start.setUTCDate(start.getUTCDate() + diffToMonday);
+
+  const weekDates: string[] = [];
+  const curr = new Date(start);
+  while (curr <= end) {
+    weekDates.push(curr.toISOString().split('T')[0]);
+    curr.setUTCDate(curr.getUTCDate() + 7);
+  }
+
+  return {
+    semName,
+    startDate: weekDates[0],
+    endDate: weekDates[weekDates.length - 1],
+    weekCount: weekDates.length,
+    weekDates
+  };
+}
+
+// Safely compute Monday to Sunday date range and numerical dates for any date
+export function getWeekDateRange(dateInput: string | Date): { mondayStr: string; sundayStr: string; startNum: number; endNum: number } {
+  let d: Date;
+  if (typeof dateInput === 'string') {
+    const parts = dateInput.split('-').map(Number);
+    d = new Date(Date.UTC(parts[0], (parts[1] || 1) - 1, parts[2] || 1));
+  } else {
+    d = new Date(Date.UTC(dateInput.getUTCFullYear(), dateInput.getUTCMonth(), dateInput.getUTCDate()));
+  }
+
+  const day = d.getUTCDay(); // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+  const diffToMonday = (day === 0 ? -6 : 1) - day;
+  const monday = new Date(d);
+  monday.setUTCDate(d.getUTCDate() + diffToMonday);
+
+  const sunday = new Date(monday);
+  sunday.setUTCDate(monday.getUTCDate() + 6);
+
+  const mondayStr = monday.toISOString().slice(0, 10);
+  const sundayStr = sunday.toISOString().slice(0, 10);
+  const startNum = parseInt(mondayStr.replace(/-/g, ''), 10);
+  const endNum = parseInt(sundayStr.replace(/-/g, ''), 10);
+
+  return { mondayStr, sundayStr, startNum, endNum };
+}
+
+// Reliable, precise WebUntis cancellation detection (avoids false positives from room changes or teacher substitutions)
+export function isPeriodCancelled(period: any): boolean {
+  if (!period) return false;
+
+  // 1. Primary Untis cancellation indicator: cellState
+  const cellState = String(period.cellState || '').toUpperCase();
+  if (cellState === 'CANCEL' || cellState === 'CANCELLED' || cellState === 'CANCELLATION') {
+    return true;
+  }
+
+  // 2. Untis code property if set to cancelled
+  if (period.code && String(period.code).toLowerCase() === 'cancelled') {
+    return true;
+  }
+
+  // 3. Substitution text / remarks in Untis
+  // Note: ONLY match explicit cancellation words and NOT if negated (e.g. "kein Ausfall", "fällt nicht aus")
+  const combinedText = [period.substText, period.lessonText, period.periodText]
+    .filter(Boolean)
+    .map(t => String(t).trim())
+    .join(' ');
+
+  if (combinedText) {
+    const isNegated = /\b(kein\s+ausfall|fällt\s+nicht\s+aus|nicht\s+abgesagt|kein\s+entfall)\b/i.test(combinedText);
+    if (!isNegated && /\b(entfällt|vorlesung\s+entfällt|stunde\s+entfällt|entfall|abgesagt|cancelled)\b/i.test(combinedText)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Helper to process a single week for a class and detect room/time changes
+async function processClassWeek(
+  schoolName: string,
+  serverUrl: string,
+  classId: number,
+  className: string,
+  subscribers: Array<{ userId: number; excludedSubjects: string[] }>,
+  dateStr: string
+): Promise<{ periodsCount: number; changesDetected: number }> {
+  let periodsCount = 0;
+  let changesDetected = 0;
+
+  const { periods, elements } = await fetchWebUntisTimetable(schoolName, serverUrl, classId, dateStr);
+
+  const processedPeriods: Array<{
+    period: any;
+    periodId: number;
+    subjectRef: any;
+    roomRef: any;
+    teacherRef: any;
+    subjectName: string;
+    subjectLongName: string;
+    roomName: string;
+    roomLongName: string;
+    teacherName: string;
+    isCancelled: number;
+    prev: any;
+    date: number;
+    startTime: number;
+    endTime: number;
+  }> = [];
+
+  for (const period of periods) {
+    periodsCount++;
+    const periodId = period.id;
+
+    // Extract referenced elements
+    const subjectRef = period.elements?.find((e: any) => e.type === 3);
+    const roomRef = period.elements?.find((e: any) => e.type === 4);
+    const teacherRef = period.elements?.find((e: any) => e.type === 2);
+
+    const subjectEl = subjectRef ? elements.get(`3:${subjectRef.id}`) : undefined;
+    const roomEl = roomRef ? elements.get(`4:${roomRef.id}`) : undefined;
+    const teacherEl = teacherRef ? elements.get(`2:${teacherRef.id}`) : undefined;
+
+    const subjectName = subjectEl?.name || subjectEl?.longName || 'Vorlesung';
+    const subjectLongName = subjectEl?.longName || subjectName;
+    const roomName = roomEl?.name || roomEl?.longName || 'Kein Raum';
+    const roomLongName = roomEl?.longName || roomName;
+    const teacherName = teacherEl?.longName || teacherEl?.name || '';
+
+    // Precise cancellation detection without false positives
+    const isCancelled = isPeriodCancelled(period) ? 1 : 0;
+
+    // Check if previously recorded in cached_periods
+    const prev = db.prepare(`
+      SELECT * FROM cached_periods WHERE period_id = ? AND class_id = ?
+    `).get(periodId, classId) as any;
+
+    processedPeriods.push({
+      period,
+      periodId,
+      subjectRef,
+      roomRef,
+      teacherRef,
+      subjectName,
+      subjectLongName,
+      roomName,
+      roomLongName,
+      teacherName,
+      isCancelled,
+      prev,
+      date: period.date,
+      startTime: period.startTime,
+      endTime: period.endTime
+    });
+
+    // Upsert into cached_periods
+    db.prepare(`
+      INSERT INTO cached_periods (
+        period_id, school_name, class_id, lesson_id, date, start_time, end_time,
+        subject_id, subject_name, subject_long_name, room_id, room_name, room_long_name,
+        teacher_id, teacher_name, cell_state, is_cancelled, raw_json, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(period_id, class_id) DO UPDATE SET
+        date = excluded.date,
+        start_time = excluded.start_time,
+        end_time = excluded.end_time,
+        subject_name = excluded.subject_name,
+        subject_long_name = excluded.subject_long_name,
+        room_name = excluded.room_name,
+        room_long_name = excluded.room_long_name,
+        teacher_name = excluded.teacher_name,
+        cell_state = excluded.cell_state,
+        is_cancelled = excluded.is_cancelled,
+        raw_json = excluded.raw_json,
+        updated_at = CURRENT_TIMESTAMP
+    `).run(
+      periodId, schoolName, classId, period.lessonId, period.date, period.startTime, period.endTime,
+      subjectRef?.id || null, subjectName, subjectLongName,
+      roomRef?.id || null, roomName, roomLongName,
+      teacherRef?.id || null, teacherName, period.cellState || 'STANDARD',
+      isCancelled, JSON.stringify({ period, elements: Array.from(elements.values()) })
+    );
+  }
+
+  // Group consecutive periods of the same subject on the same day (Doppelstunden / multiple blocks)
+  // so that only 1 consolidated notification is triggered per lecture block
+  const sortedPeriods = [...processedPeriods].sort((a, b) => {
+    if (a.date !== b.date) return a.date - b.date;
+    return a.startTime - b.startTime;
+  });
+
+  const mergedBlocks: Array<typeof processedPeriods> = [];
+  let idx = 0;
+  while (idx < sortedPeriods.length) {
+    const cur = sortedPeriods[idx];
+    const block = [cur];
+    let j = idx + 1;
+    while (j < sortedPeriods.length) {
+      const prevP = sortedPeriods[j - 1];
+      const nextP = sortedPeriods[j];
+      if (
+        nextP.date === cur.date &&
+        nextP.subjectName.trim().toLowerCase() === cur.subjectName.trim().toLowerCase() &&
+        !(prevP.endTime <= 1300 && nextP.startTime >= 1350)
+      ) {
+        const prevEndMin = Math.floor(prevP.endTime / 100) * 60 + (prevP.endTime % 100);
+        const nextStartMin = Math.floor(nextP.startTime / 100) * 60 + (nextP.startTime % 100);
+        if (nextStartMin >= prevEndMin && nextStartMin - prevEndMin <= 30) {
+          block.push(nextP);
+          j++;
+          continue;
+        }
+      }
+      break;
+    }
+    mergedBlocks.push(block);
+    idx = j;
+  }
+
+  // Detect changes for each consolidated block
+  for (const block of mergedBlocks) {
+    const firstP = block[0];
+    const lastP = block[block.length - 1];
+    const subjectName = firstP.subjectName;
+    const dateFormatted = formatUntisDate(firstP.date);
+    const startTimeFormatted = formatUntisTime(firstP.startTime);
+    const endTimeFormatted = formatUntisTime(lastP.endTime);
+    const isMultiBlock = block.length >= 2;
+    const blockLabel = block.length === 2 ? 'Doppelstunde' : isMultiBlock ? `${block.length} Blöcke` : '';
+    const blockLabelWithParens = blockLabel ? ` (${blockLabel})` : '';
+    const timeRangeDesc = isMultiBlock
+      ? `von ${startTimeFormatted} bis ${endTimeFormatted} Uhr${blockLabel ? ` (${blockLabel})` : ''}`
+      : `um ${startTimeFormatted} Uhr`;
+
+    // 1. Ausfall / Cancellation Check: Only 1 notification for the entire double/multi-block period!
+    const newlyCancelled = block.filter(p => p.prev && !p.prev.is_cancelled && p.isCancelled);
+    if (newlyCancelled.length > 0) {
+      changesDetected++;
+      const title = `❌ Vorlesungsausfall: ${subjectName}${blockLabelWithParens}`;
+      const message = `Die Vorlesung "${subjectName}" (${className}${blockLabel ? ', ' + blockLabel : ''}) am ${dateFormatted} ${timeRangeDesc} entfällt!`;
+
+      for (const sub of subscribers) {
+        if (!sub.excludedSubjects.includes(subjectName)) {
+          addNotification(sub.userId, {
+            type: 'cancellation',
+            title,
+            message,
+            lessonName: subjectName,
+            date: dateFormatted,
+            startTime: startTimeFormatted
+          });
+        }
+      }
+    }
+
+    // 2. Revocation of Cancellation: If a lesson was cancelled earlier, but Untis restored it
+    const newlyRestored = block.filter(p => p.prev && p.prev.is_cancelled && !p.isCancelled);
+    if (newlyRestored.length > 0 && newlyCancelled.length === 0) {
+      changesDetected++;
+      const title = `✅ Ausfall aufgehoben: ${subjectName}${blockLabelWithParens}`;
+      const message = `Die Vorlesung "${subjectName}" (${className}${blockLabel ? ', ' + blockLabel : ''}) am ${dateFormatted} ${timeRangeDesc} findet doch wie gewohnt statt (Entfall aufgehoben)!`;
+
+      for (const sub of subscribers) {
+        if (!sub.excludedSubjects.includes(subjectName)) {
+          addNotification(sub.userId, {
+            type: 'cancellation',
+            title,
+            message,
+            lessonName: subjectName,
+            date: dateFormatted,
+            startTime: startTimeFormatted
+          });
+        }
+      }
+    }
+
+    // 3. Raumänderung Check (only when not cancelled)
+    const roomChanges = block.filter(p => p.prev?.room_name && p.roomName && p.prev.room_name !== p.roomName && !p.prev.is_cancelled && !p.isCancelled);
+    if (roomChanges.length > 0 && newlyCancelled.length === 0) {
+      changesDetected++;
+      const title = `🚨 Raumänderung: ${subjectName}`;
+      const message = `Der Raum für "${subjectName}" (${className}) am ${dateFormatted} (${timeRangeDesc}) wurde von "${roomChanges[0].prev.room_name}" auf "${roomChanges[0].roomName}" geändert.`;
+
+      for (const sub of subscribers) {
+        if (!sub.excludedSubjects.includes(subjectName)) {
+          addNotification(sub.userId, {
+            type: 'room_change',
+            title,
+            message,
+            lessonName: subjectName,
+            oldValue: roomChanges[0].prev.room_name,
+            newValue: roomChanges[0].roomName,
+            date: dateFormatted,
+            startTime: startTimeFormatted
+          });
+        }
+      }
+    }
+
+    // 4. Termin- / Datumsverschiebung Check (different day)
+    const dateShifts = block.filter(p => p.prev && p.prev.date !== p.date && !p.isCancelled);
+    if (dateShifts.length > 0 && newlyCancelled.length === 0) {
+      changesDetected++;
+      const oldDateFormatted = formatUntisDate(dateShifts[0].prev.date);
+      const oldTimeFormatted = formatUntisTime(dateShifts[0].prev.start_time);
+      const title = `📅 Vorlesung verschoben: ${subjectName}`;
+      const message = `Die Vorlesung "${subjectName}" (${className}) wurde vom ${oldDateFormatted} (${oldTimeFormatted} Uhr) auf den ${dateFormatted} (${startTimeFormatted} Uhr) verschoben!`;
+
+      for (const sub of subscribers) {
+        if (!sub.excludedSubjects.includes(subjectName)) {
+          addNotification(sub.userId, {
+            type: 'time_change',
+            title,
+            message,
+            lessonName: subjectName,
+            oldValue: `${oldDateFormatted} ${oldTimeFormatted}`,
+            newValue: `${dateFormatted} ${startTimeFormatted}`,
+            date: dateFormatted,
+            startTime: startTimeFormatted
+          });
+        }
+      }
+    } else {
+      // 5. Zeitänderung Check am selben Tag
+      const timeChanges = block.filter(p => p.prev && p.prev.date === p.date && (p.prev.start_time !== p.startTime || p.prev.end_time !== p.endTime) && !p.isCancelled);
+      if (timeChanges.length > 0 && newlyCancelled.length === 0) {
+        changesDetected++;
+        const oldTime = `${formatUntisTime(timeChanges[0].prev.start_time)}-${formatUntisTime(timeChanges[timeChanges.length - 1].prev.end_time)}`;
+        const newTime = `${startTimeFormatted}-${endTimeFormatted}`;
+        const title = `⏰ Zeitänderung: ${subjectName}`;
+        const message = `Die Vorlesungszeit für "${subjectName}" (${className}) am ${dateFormatted} wurde von ${oldTime} Uhr auf ${newTime} Uhr geändert.`;
+
+        for (const sub of subscribers) {
+          if (!sub.excludedSubjects.includes(subjectName)) {
+            addNotification(sub.userId, {
+              type: 'time_change',
+              title,
+              message,
+              lessonName: subjectName,
+              oldValue: oldTime,
+              newValue: newTime,
+              date: dateFormatted,
+              startTime: startTimeFormatted
+            });
+          }
+        }
+      }
+    }
+
+    // 6. Dozentenänderung Check
+    const teacherChanges = block.filter(p => p.prev?.teacher_name && p.teacherName && p.prev.teacher_name !== p.teacherName && !p.prev.is_cancelled && !p.isCancelled);
+    if (teacherChanges.length > 0 && newlyCancelled.length === 0) {
+      changesDetected++;
+      const title = `👤 Dozentenänderung: ${subjectName}`;
+      const message = `Für "${subjectName}" (${className}) am ${dateFormatted} (${timeRangeDesc}) wurde der Dozent von "${teacherChanges[0].prev.teacher_name}" auf "${teacherChanges[0].teacherName}" geändert.`;
+
+      for (const sub of subscribers) {
+        if (!sub.excludedSubjects.includes(subjectName)) {
+          addNotification(sub.userId, {
+            type: 'substitution',
+            title,
+            message,
+            lessonName: subjectName,
+            oldValue: teacherChanges[0].prev.teacher_name,
+            newValue: teacherChanges[0].teacherName,
+            date: dateFormatted,
+            startTime: startTimeFormatted
+          });
+        }
+      }
+    }
+
+    // 7. Dozenten-Hinweis Check
+    for (const p of block) {
+      try {
+        if (p.prev?.raw_json) {
+          const prevRaw = JSON.parse(p.prev.raw_json);
+          const prevNote = [prevRaw.period?.periodText, prevRaw.period?.substText].filter(Boolean).join(' ').trim();
+          const newNote = [p.period.periodText, p.period.substText].filter(Boolean).join(' ').trim();
+          if (newNote && (!prevNote || prevNote !== newNote) && !p.isCancelled) {
+            changesDetected++;
+            const title = `💬 Neuer Dozenten-Hinweis: ${subjectName}`;
+            const message = `Für "${subjectName}" (${className}) am ${dateFormatted} (${timeRangeDesc}) wurde ein Dozenten-Hinweis hinterlegt: "${newNote.slice(0, 140)}${newNote.length > 140 ? '...' : ''}"`;
+
+            for (const sub of subscribers) {
+              if (!sub.excludedSubjects.includes(subjectName)) {
+                addNotification(sub.userId, {
+                  type: 'info',
+                  title,
+                  message,
+                  lessonName: subjectName,
+                  newValue: newNote,
+                  date: dateFormatted,
+                  startTime: startTimeFormatted
+                });
+              }
+            }
+            break; // Only notify once per block
+          }
+        }
+      } catch (e) {}
+    }
+  }
+
+  // Detect and purge stale periods previously cached for this class in this week that are no longer returned in Untis
+  // (e.g. rescheduled to another time slot or removed from curriculum)
+  // Only execute cleanup if periods were successfully fetched to avoid deleting data on empty/malformed responses
+  if (periods.length > 0) {
+    try {
+      const { startNum: weekStartNum, endNum: weekEndNum } = getWeekDateRange(dateStr);
+      const returnedIds = new Set(periods.map(p => p.id));
+      const existingInWeek = db.prepare(`
+        SELECT period_id FROM cached_periods
+        WHERE class_id = ? AND date >= ? AND date <= ?
+      `).all(classId, weekStartNum, weekEndNum) as any[];
+
+      for (const prev of existingInWeek) {
+        if (!returnedIds.has(prev.period_id)) {
+          // Stale/removed period in Untis: delete from database rather than falsely marking as cancelled
+          db.prepare(`
+            DELETE FROM cached_periods
+            WHERE period_id = ? AND class_id = ?
+          `).run(prev.period_id, classId);
+        }
+      }
+    } catch (err: any) {
+      console.warn('[Sync] Warning detecting deleted periods for week', dateStr, err.message);
+    }
+  }
+
+  return { periodsCount, changesDetected };
+}
+
+// Synchronize all enrolled classes across weeks and detect short-term room/time adjustments
+export async function syncTimetables(options: { forceUserId?: number; fullSemester?: boolean } = {}) {
+  const startTime = Date.now();
+  console.log('[Sync] Starting timetable sync at', new Date().toISOString());
+
+  // Get all classes that users have selected
+  const usersSettingsRows = db.prepare('SELECT user_id, school_name, server_url, selected_classes, excluded_subjects FROM user_settings').all() as any[];
+
+  // Map classId -> list of { userId, excludedSubjects, schoolName, serverUrl, className }
+  const classSubscribers = new Map<number, Array<{
+    userId: number;
+    excludedSubjects: string[];
+    schoolName: string;
+    serverUrl: string;
+    className: string;
+  }>>();
+
+  for (const row of usersSettingsRows) {
+    if (options.forceUserId && row.user_id !== options.forceUserId) continue;
+
+    let selectedClasses: SelectedClass[] = [];
+    let excludedSubjects: string[] = [];
+    try {
+      selectedClasses = JSON.parse(row.selected_classes);
+      excludedSubjects = JSON.parse(row.excluded_subjects);
+    } catch (e) {
+      continue;
+    }
+
+    for (const cls of selectedClasses) {
+      if (!classSubscribers.has(cls.id)) {
+        classSubscribers.set(cls.id, []);
+      }
+      classSubscribers.get(cls.id)!.push({
+        userId: row.user_id,
+        excludedSubjects,
+        schoolName: row.school_name,
+        serverUrl: row.server_url,
+        className: cls.name
+      });
+    }
+  }
+
+  let totalPeriods = 0;
+  let changesDetected = 0;
+
+  // Determine dates to sync
+  const semInfo = getSemesterPeriodInfo();
+  // By default, sync all semester weeks (or when fullSemester requested)
+  // To ensure every course throughout the entire semester is covered
+  const datesToSync: string[] = options.fullSemester !== false
+    ? semInfo.weekDates
+    : (() => {
+        const near: string[] = [];
+        const now = new Date();
+        for (let offset = -1; offset <= 4; offset++) {
+          const d = new Date(now.getTime() + offset * 7 * 24 * 60 * 60 * 1000);
+          const { mondayStr } = getWeekDateRange(d);
+          if (!near.includes(mondayStr)) {
+            near.push(mondayStr);
+          }
+        }
+        return near;
+      })();
+
+  console.log(`[Sync] Scanning ${datesToSync.length} weeks for ${classSubscribers.size} classes...`);
+
+  for (const [classId, subscribers] of classSubscribers.entries()) {
+    if (subscribers.length === 0) continue;
+    const { schoolName, serverUrl, className } = subscribers[0];
+
+    // Process in parallel batches of 4 weeks to balance speed and connection limits
+    const batchSize = 4;
+    for (let i = 0; i < datesToSync.length; i += batchSize) {
+      const chunk = datesToSync.slice(i, i + batchSize);
+      const results = await Promise.allSettled(
+        chunk.map(dateStr =>
+          processClassWeek(schoolName, serverUrl, classId, className, subscribers, dateStr)
+        )
+      );
+
+      for (const res of results) {
+        if (res.status === 'fulfilled') {
+          totalPeriods += res.value.periodsCount;
+          changesDetected += res.value.changesDetected;
+        } else {
+          console.warn(`[Sync] Week fetch warning for class ${className} (${classId}):`, res.reason?.message);
+        }
+      }
+    }
+  }
+
+  // Record sync history
+  db.prepare(`
+    INSERT INTO sync_history (status, classes_count, periods_count, changes_count, details)
+    VALUES ('success', ?, ?, ?, ?)
+  `).run(
+    classSubscribers.size,
+    totalPeriods,
+    changesDetected,
+    `Sync completed in ${Date.now() - startTime}ms`
+  );
+
+  // Bump user_settings updated_at so calendar feeds immediately recognize changes
+  try {
+    const subscriberUserIds = new Set<number>();
+    for (const subs of classSubscribers.values()) {
+      for (const s of subs) {
+        subscriberUserIds.add(s.userId);
+      }
+    }
+    if (subscriberUserIds.size > 0) {
+      const userPlaceholders = Array.from(subscriberUserIds).map(() => '?').join(',');
+      db.prepare(`
+        UPDATE user_settings
+        SET updated_at = CURRENT_TIMESTAMP
+        WHERE user_id IN (${userPlaceholders})
+      `).run(...Array.from(subscriberUserIds));
+    }
+  } catch (err: any) {
+    console.warn('[Sync] Could not update calendar feed timestamp for users:', err.message);
+  }
+
+  console.log(`[Sync] Finished. Tracked ${totalPeriods} periods across ${datesToSync.length} weeks, ${changesDetected} changes detected.`);
+  return {
+    classesCount: classSubscribers.size,
+    weeksScanned: datesToSync.length,
+    totalPeriods,
+    changesDetected,
+    durationMs: Date.now() - startTime
+  };
+}
+
+// Dedicated full semester scan for a specific user
+export async function scanFullSemesterForUser(
+  userId: number,
+  options: { onlyUncachedClasses?: boolean; forceAll?: boolean } = {}
+) {
+  const startTime = Date.now();
+  const settings = getUserSettings(userId);
+  if (!settings.selectedClasses || settings.selectedClasses.length === 0) {
+    return {
+      semesterName: '',
+      startDate: '',
+      endDate: '',
+      totalWeeksScanned: 0,
+      totalPeriodsFound: 0,
+      uniqueSubjectsFound: 0,
+      classesCount: 0,
+      durationMs: 0
+    };
+  }
+
+  const semInfo = getSemesterPeriodInfo();
+  const schoolName = settings.schoolName;
+  const serverUrl = settings.serverUrl;
+  const subscribers = [{
+    userId,
+    excludedSubjects: settings.excludedSubjects || []
+  }];
+
+  let totalPeriodsFound = 0;
+  let changesDetected = 0;
+
+  // Filter classes to scan (skip classes already in cached_periods if onlyUncachedClasses is requested)
+  const classesToScan = settings.selectedClasses.filter(cls => {
+    if (options.forceAll) return true;
+    if (options.onlyUncachedClasses) {
+      try {
+        const cachedCount = (db.prepare('SELECT COUNT(*) as cnt FROM cached_periods WHERE class_id = ?').get(cls.id) as any)?.cnt || 0;
+        return cachedCount === 0;
+      } catch {
+        return true;
+      }
+    }
+    return true;
+  });
+
+  if (classesToScan.length === 0) {
+    console.log(`[SemesterScan] All ${settings.selectedClasses.length} selected classes for user ${userId} are already cached. Serving instantly.`);
+  } else {
+    console.log(`[SemesterScan] Scanning ${classesToScan.length} of ${settings.selectedClasses.length} classes for user ${userId} (${semInfo.semName}, ${semInfo.weekDates.length} weeks)...`);
+
+    for (const cls of classesToScan) {
+      const batchSize = 6;
+      for (let i = 0; i < semInfo.weekDates.length; i += batchSize) {
+        const chunk = semInfo.weekDates.slice(i, i + batchSize);
+        const results = await Promise.allSettled(
+          chunk.map(dateStr =>
+            processClassWeek(schoolName, serverUrl, cls.id, cls.name, subscribers, dateStr)
+          )
+        );
+
+        for (const res of results) {
+          if (res.status === 'fulfilled') {
+            totalPeriodsFound += res.value.periodsCount;
+            changesDetected += res.value.changesDetected;
+          }
+        }
+      }
+    }
+  }
+
+  // Count unique subjects now in cache for these classes
+  const classIds = settings.selectedClasses.map(c => c.id);
+  const placeholders = classIds.map(() => '?').join(',');
+  const distinctSubjects = db.prepare(`
+    SELECT DISTINCT subject_name FROM cached_periods
+    WHERE class_id IN (${placeholders}) AND subject_name IS NOT NULL
+  `).all(...classIds) as any[];
+
+  console.log(`[SemesterScan] Finished in ${Date.now() - startTime}ms. Found ${distinctSubjects.length} subjects and ${totalPeriodsFound} lesson slots.`);
+
+  return {
+    semesterName: semInfo.semName,
+    startDate: semInfo.startDate,
+    endDate: semInfo.endDate,
+    totalWeeksScanned: semInfo.weekDates.length,
+    totalPeriodsFound,
+    uniqueSubjectsFound: distinctSubjects.length,
+    classesCount: settings.selectedClasses.length,
+    changesDetected,
+    durationMs: Date.now() - startTime
+  };
+}
+
+// Check if a lesson or subject is hybrid (both in-person and online, or conducted online/hybrid)
+export function isHybridEvent(params: {
+  subjectName?: string;
+  subjectLongName?: string;
+  roomName?: string;
+  roomLongName?: string;
+  studentGroup?: string;
+  lessonText?: string;
+  periodText?: string;
+  substText?: string;
+  hybridSubjects?: string[];
+}): boolean {
+  if (params.hybridSubjects && params.hybridSubjects.length > 0) {
+    if (params.subjectName && params.hybridSubjects.includes(params.subjectName)) return true;
+    if (params.subjectLongName && params.hybridSubjects.includes(params.subjectLongName)) return true;
+  }
+
+  // 1. Room check (e.g. "online", "virtueller Raum", "Zoom", "Teams")
+  const roomText = [params.roomName, params.roomLongName].filter(Boolean).join(' ');
+  if (/\b(online|zoom|teams|webex|virtuell\w*|virtual\w*|distanz\w*|moodle|bbb|bigbluebutton|stream\w*|videokonferenz\w*|alfaview\w*)\b/i.test(roomText)) {
+    return true;
+  }
+
+  // 2. Extra lesson texts and notes (e.g. lessonText "online", "hybrid", "zoom", etc.)
+  const extraText = [params.studentGroup, params.lessonText, params.periodText, params.substText].filter(Boolean).join(' ');
+  if (/\b(hybrid\w*|hyb\w*|online|zoom|teams|webex|virtuell\w*|virtual\w*|distanz\w*|stream\w*|videokonferenz\w*)\b|präsenz\s*(&|\/|\+)\s*online|online\s*(&|\/|\+)\s*präsenz/i.test(extraText)) {
+    return true;
+  }
+
+  // 3. Subject name explicitly tagged as online or hybrid
+  const subjText = [params.subjectName, params.subjectLongName].filter(Boolean).join(' ');
+  if (/\b(hybrid\w*|hyb\w*)\b|(\(online\))|\[online\]|(\(hybrid\))|\[hybrid\]|hybrid-|\bhyb\b|präsenz\s*(&|\/|\+)\s*online|online\s*(&|\/|\+)\s*präsenz/i.test(subjText)) {
+    return true;
+  }
+
+  return false;
+}
+
+// Get personal combined and filtered timetable for a user
+export function getUserTimetable(userId: number, options: { fromDate?: string; toDate?: string } = {}): {
+  lessons: TimetableLesson[];
+  availableSubjects: Array<{ name: string; longName: string; count: number; firstDate?: string; lastDate?: string; isHybrid?: boolean }>;
+  classes: SelectedClass[];
+  semesterInfo: SemesterPeriodInfo;
+} {
+  const semInfo = getSemesterPeriodInfo();
+  const settings = getUserSettings(userId);
+  if (!settings.selectedClasses || settings.selectedClasses.length === 0) {
+    return { lessons: [], availableSubjects: [], classes: [], semesterInfo: semInfo };
+  }
+
+  const classIds = settings.selectedClasses.map(c => c.id);
+  const placeholders = classIds.map(() => '?').join(',');
+
+  const rows = db.prepare(`
+    SELECT * FROM cached_periods
+    WHERE class_id IN (${placeholders})
+    ORDER BY date ASC, start_time ASC
+  `).all(...classIds) as any[];
+
+  const subjectCounts = new Map<string, { name: string; longName: string; count: number; firstDate: string; lastDate: string; isHybrid?: boolean }>();
+  const lessons: TimetableLesson[] = [];
+
+  const classMap = new Map(settings.selectedClasses.map(c => [c.id, c.name]));
+  const excludedSet = new Set(settings.excludedSubjects || []);
+  const hybridSet = new Set(settings.hybridSubjects || []);
+
+  for (const row of rows) {
+    const subjectName = row.subject_name || 'Vorlesung';
+    const subjectLongName = row.subject_long_name || subjectName;
+    const dateFormatted = formatUntisDate(row.date);
+
+    // Parse raw_json for extra colors / groups / notes if available
+    let subjectColor: string | undefined;
+    let studentGroup: string | undefined;
+    let originalRoomName: string | undefined;
+    let lessonText: string | undefined;
+    let periodText: string | undefined;
+    let substText: string | undefined;
+
+    try {
+      if (row.raw_json) {
+        const parsed = JSON.parse(row.raw_json);
+        const subElem = parsed.elements?.find((e: any) => e.type === 3 && (e.backColor || e.name === subjectName));
+        if (subElem?.backColor) {
+          subjectColor = subElem.backColor;
+        }
+        studentGroup = parsed.period?.studentGroup;
+        lessonText = parsed.period?.lessonText;
+        periodText = parsed.period?.periodText;
+        substText = parsed.period?.substText;
+      }
+    } catch (e) {}
+
+    // Track all available subjects for filter UI across the whole semester
+    if (!subjectCounts.has(subjectName)) {
+      subjectCounts.set(subjectName, {
+        name: subjectName,
+        longName: subjectLongName,
+        count: 0,
+        firstDate: dateFormatted,
+        lastDate: dateFormatted,
+        isHybrid: false
+      });
+    }
+    const subjTracker = subjectCounts.get(subjectName)!;
+    subjTracker.count++;
+    if (dateFormatted < subjTracker.firstDate) subjTracker.firstDate = dateFormatted;
+    if (dateFormatted > subjTracker.lastDate) subjTracker.lastDate = dateFormatted;
+
+    // Check exclusion
+    if (excludedSet.has(subjectName)) {
+      continue;
+    }
+
+    if (options.fromDate && dateFormatted < options.fromDate) continue;
+    if (options.toDate && dateFormatted > options.toDate) continue;
+
+    const className = classMap.get(row.class_id) || `Klasse ${row.class_id}`;
+
+    // Distinct colors based on subject name if none provided
+    if (!subjectColor) {
+      const colors = [
+        '#3b82f6', '#10b981', '#8b5cf6', '#f59e0b', '#06b6d4',
+        '#ec4899', '#6366f1', '#14b8a6', '#f97316', '#84cc16'
+      ];
+      let hash = 0;
+      for (let i = 0; i < subjectName.length; i++) {
+        hash = subjectName.charCodeAt(i) + ((hash << 5) - hash);
+      }
+      subjectColor = colors[Math.abs(hash) % colors.length];
+    }
+
+    lessons.push({
+      id: row.period_id,
+      lessonId: row.lesson_id,
+      date: row.date,
+      startTime: row.start_time,
+      endTime: row.end_time,
+      dateStr: dateFormatted,
+      startTimeStr: formatUntisTime(row.start_time),
+      endTimeStr: formatUntisTime(row.end_time),
+      subjectName,
+      subjectLongName,
+      subjectId: row.subject_id,
+      subjectColor,
+      roomName: row.room_name || 'TBA',
+      roomLongName: row.room_long_name || row.room_name || 'TBA',
+      roomId: row.room_id,
+      teacherName: row.teacher_name || '',
+      teacherLongName: row.teacher_name || '',
+      teacherId: row.teacher_id,
+      className,
+      classId: row.class_id,
+      studentGroup,
+      cellState: row.cell_state,
+      isCancelled: Boolean(row.is_cancelled),
+      isSubstitution: row.cell_state === 'SUBSTITUTION',
+      isRoomChanged: false,
+      isHybrid: false,
+      originalRoomName,
+      lessonText,
+      periodText,
+      substText
+    });
+  }
+
+  const availableSubjects = Array.from(subjectCounts.values()).sort((a, b) => a.name.localeCompare(b.name));
+
+  return {
+    lessons,
+    availableSubjects,
+    classes: settings.selectedClasses,
+    semesterInfo: semInfo
+  };
+}
+
+// Escape special characters in iCalendar text fields according to RFC 5545
+function escapeIcsText(str: string): string {
+  if (!str) return '';
+  return str
+    .replace(/\\/g, '\\\\')
+    .replace(/;/g, '\\;')
+    .replace(/,/g, '\\,')
+    .replace(/\r?\n/g, '\\n');
+}
+
+// Generate RFC 5545 iCal / .ics file content
+export function generateIcsCalendar(
+  lessons: TimetableLesson[],
+  calendarName = 'Mein-Stundenplan',
+  options: { sequence?: number; lastModified?: Date; omitCancelled?: boolean } = {}
+): string {
+  const lastModDate = options.lastModified || new Date();
+  const dtStampNow = lastModDate.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+  const sequenceNum = Math.max(0, options.sequence ?? 0);
+
+  const lines: string[] = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//Mein-Stundenplan//DE',
+    'CALSCALE:GREGORIAN',
+    'METHOD:PUBLISH',
+    `X-WR-CALNAME:${escapeIcsText(calendarName)}`,
+    'X-WR-CALDESC:Dein persönlicher Stundenplan mit automatischen Aktualisierungen',
+    'X-WR-TIMEZONE:Europe/Berlin',
+    'X-PUBLISHED-TTL:PT15M',
+    'REFRESH-INTERVAL;VALUE=DURATION:PT15M',
+    'BEGIN:VTIMEZONE',
+    'TZID:Europe/Berlin',
+    'BEGIN:DAYLIGHT',
+    'TZOFFSETFROM:+0100',
+    'TZOFFSETTO:+0200',
+    'TZNAME:CEST',
+    'DTSTART:19700329T020000',
+    'RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU',
+    'END:DAYLIGHT',
+    'BEGIN:STANDARD',
+    'TZOFFSETFROM:+0200',
+    'TZOFFSETTO:+0100',
+    'TZNAME:CET',
+    'DTSTART:19701025T030000',
+    'RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU',
+    'END:STANDARD',
+    'END:VTIMEZONE'
+  ];
+
+  // Group consecutive lessons of the same subject on the same day (no merge across lunch break 13:00 - 14:00)
+  const sortedLessons = [...lessons].sort((a, b) => {
+    if (a.date !== b.date) return a.date - b.date;
+    return a.startTime - b.startTime;
+  });
+
+  const mergedEvents: TimetableLesson[] = [];
+  let i = 0;
+  while (i < sortedLessons.length) {
+    const cur = sortedLessons[i];
+    const group = [cur];
+    let j = i + 1;
+    while (j < sortedLessons.length) {
+      const prev = sortedLessons[j - 1];
+      const next = sortedLessons[j];
+      if (
+        next.date === cur.date &&
+        next.subjectName.trim().toLowerCase() === cur.subjectName.trim().toLowerCase() &&
+        next.isCancelled === cur.isCancelled &&
+        !(prev.endTime <= 1300 && next.startTime >= 1350)
+      ) {
+        const prevEndMin = Math.floor(prev.endTime / 100) * 60 + (prev.endTime % 100);
+        const nextStartMin = Math.floor(next.startTime / 100) * 60 + (next.startTime % 100);
+        if (nextStartMin >= prevEndMin && nextStartMin - prevEndMin <= 30) {
+          group.push(next);
+          j++;
+          continue;
+        }
+      }
+      break;
+    }
+
+    if (group.length === 1) {
+      mergedEvents.push(cur);
+    } else {
+      const first = group[0];
+      const last = group[group.length - 1];
+      const physicalRoom = group.find(l => {
+        const r = (l.roomName || '').trim();
+        return r && r !== '-' && r !== '—' && r.toLowerCase() !== 'kein raum';
+      });
+      mergedEvents.push({
+        ...first,
+        id: `${first.id}_${group.length}x_${last.id}`,
+        endTime: Math.max(...group.map(l => l.endTime)),
+        endTimeStr: last.endTimeStr || first.endTimeStr,
+        roomName: physicalRoom ? physicalRoom.roomName : (first.roomName || last.roomName),
+        roomLongName: physicalRoom ? physicalRoom.roomLongName : (first.roomLongName || last.roomLongName),
+        isHybrid: group.some(l => l.isHybrid),
+        teacherName: group.map(l => l.teacherName).find(Boolean) || first.teacherName
+      });
+    }
+    i = j;
+  }
+
+  for (const lesson of mergedEvents) {
+    const dateStr = lesson.date.toString();
+    const startTimeStr = lesson.startTime.toString().padStart(4, '0');
+    const endTimeStr = lesson.endTime.toString().padStart(4, '0');
+
+    const dtStart = `${dateStr}T${startTimeStr}00`;
+    const dtEnd = `${dateStr}T${endTimeStr}00`;
+    const dtStamp = dtStampNow;
+    const uid = `lesson-${lesson.id}-${lesson.classId}-${dateStr}@stundenplan-manager`;
+
+    let summary = lesson.subjectName;
+    if (lesson.roomName) {
+      summary += ` (${lesson.roomName})`;
+    }
+
+    let location = lesson.roomName || 'TBA';
+
+    let description = `Fach: ${lesson.subjectLongName}\nKlasse: ${lesson.className}`;
+    if (lesson.teacherName) {
+      description += `\nDozent/in: ${lesson.teacherName}`;
+    }
+    if (lesson.studentGroup) {
+      description += `\nGruppe: ${lesson.studentGroup}`;
+    }
+    if (lesson.periodText && !/^(online|hybrid|präsenz|präsenzveranstaltung)$/i.test(lesson.periodText.trim())) {
+      description += `\nHinweis: ${lesson.periodText}`;
+    }
+    if (lesson.substText && lesson.substText !== lesson.periodText && !/^(online|hybrid|präsenz|präsenzveranstaltung)$/i.test(lesson.substText.trim())) {
+      description += `\nVertretung: ${lesson.substText}`;
+    }
+
+    if (lesson.isCancelled) {
+      if (options.omitCancelled) {
+        continue;
+      }
+      lines.push(
+        'BEGIN:VEVENT',
+        `UID:${uid}`,
+        `DTSTAMP:${dtStamp}`,
+        `LAST-MODIFIED:${dtStamp}`,
+        `SEQUENCE:${sequenceNum + 1}`,
+        `DTSTART;TZID=Europe/Berlin:${dtStart}`,
+        `DTEND;TZID=Europe/Berlin:${dtEnd}`,
+        `SUMMARY:${escapeIcsText(`[GESTRICHEN] ${summary}`)}`,
+        `DESCRIPTION:${escapeIcsText(`❌ VORLESUNG ENTFÄLLT: Diese Vorlesung wurde aus dem Stundenplan gestrichen!\n${description}`)}`,
+        `LOCATION:${escapeIcsText(location)}`,
+        'STATUS:CANCELLED',
+        'TRANSP:TRANSPARENT',
+        'END:VEVENT'
+      );
+      continue;
+    }
+
+    lines.push(
+      'BEGIN:VEVENT',
+      `UID:${uid}`,
+      `DTSTAMP:${dtStamp}`,
+      `LAST-MODIFIED:${dtStamp}`,
+      `SEQUENCE:${sequenceNum}`,
+      `DTSTART;TZID=Europe/Berlin:${dtStart}`,
+      `DTEND;TZID=Europe/Berlin:${dtEnd}`,
+      `SUMMARY:${escapeIcsText(summary)}`,
+      `DESCRIPTION:${escapeIcsText(description)}`,
+      `LOCATION:${escapeIcsText(location)}`,
+      'STATUS:CONFIRMED',
+      'BEGIN:VALARM',
+      'TRIGGER:-PT15M',
+      'ACTION:DISPLAY',
+      `DESCRIPTION:${escapeIcsText(`Erinnerung: ${lesson.subjectName} in Raum ${lesson.roomName}`)}`,
+      'END:VALARM',
+      'END:VEVENT'
+    );
+  }
+
+  lines.push('END:VCALENDAR');
+  return lines.join('\r\n');
+}
