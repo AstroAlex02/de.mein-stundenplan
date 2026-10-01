@@ -170,24 +170,14 @@ export const CalendarModal: React.FC<CalendarModalProps> = ({
               </div>
             </div>
 
-            <div className="pt-1 flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center space-x-2">
-                <a
-                  href={webcalUrl}
-                  className="inline-flex items-center space-x-1 text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 font-bold text-[11px]"
-                >
-                  <span>Direkt auf iPhone / Mac öffnen</span>
-                  <ExternalLink className="w-3 h-3" />
-                </a>
-              </div>
-
-              {customServerUrl && (
+            {customServerUrl && (
+              <div className="pt-1 flex items-center justify-end">
                 <span className="inline-flex items-center space-x-1 text-[10px] text-emerald-700 dark:text-emerald-400 font-medium">
                   <Globe className="w-3 h-3" />
                   <span>Server-Domain aktiv: {customServerUrl}</span>
                 </span>
-              )}
-            </div>
+              </div>
+            )}
 
             {/* Quick Setup Instructions Tabs */}
             <div className="pt-2 border-t border-blue-100 dark:border-blue-900/60">
@@ -225,17 +215,39 @@ export const CalendarModal: React.FC<CalendarModalProps> = ({
               </div>
 
               {activeGuideTab === 'apple' && (
-                <p className="text-[10px] text-slate-500 dark:text-slate-400 leading-normal">
-                  <strong>iPhone / iPad / Mac:</strong> Klicke auf &quot;Direkt auf iPhone / Mac öffnen&quot; oder gehe in Kalender auf <em>Ablage &gt; Neues Kalenderabonnement</em> und füge die URL ein.
-                </p>
+                <div className="space-y-2 text-[10px] text-slate-500 dark:text-slate-400 leading-normal">
+                  <div className="flex items-center space-x-2 pt-0.5">
+                    <a
+                      href={webcalUrl}
+                      className="inline-flex items-center space-x-1 px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded font-bold text-[10px] transition-colors"
+                    >
+                      <span>Direkt auf iPhone / Mac öffnen</span>
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+                  <p>
+                    <strong>iPhone / iPad / Mac:</strong> Klicke auf &quot;Direkt auf iPhone / Mac öffnen&quot; oder gehe in Kalender auf <em>Ablage &gt; Neues Kalenderabonnement</em> und füge die URL ein.
+                  </p>
+                  <p className="text-emerald-700 dark:text-emerald-300 text-[9.5px] bg-emerald-50 dark:bg-emerald-950/40 p-1.5 rounded border border-emerald-200/60 dark:border-emerald-900/40 font-medium">
+                    ✓ <strong>Apple Kalender:</strong> Ausfälle werden von Apple nativ erkannt, sauber durchgestrichen und mit dem Status &quot;Abgesagt&quot; versehen (ganz ohne [GESTRICHEN]-Zusatz).
+                  </p>
+                </div>
               )}
               {activeGuideTab === 'google' && (
-                <div className="space-y-1 text-[10px] text-slate-500 dark:text-slate-400 leading-normal">
+                <div className="space-y-2 text-[10px] text-slate-500 dark:text-slate-400 leading-normal">
+                  <div className="flex items-center space-x-2 pt-0.5">
+                    <a
+                      href={`https://calendar.google.com/calendar/render?cid=${encodeURIComponent(feedUrl.replace(/^http:/, 'https:'))}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center space-x-1 px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded font-bold text-[10px] transition-colors"
+                    >
+                      <span>Direkt in Google Kalender abonnieren</span>
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
                   <p>
-                    <strong>Google Kalender (Android / Web):</strong> Öffne <em>calendar.google.com</em> im Browser, klicke links neben <em>&quot;Weitere Kalender&quot;</em> auf das <strong>+</strong> &gt; <em>&quot;Per URL hinzufügen&quot;</em> und füge die URL ein.
-                  </p>
-                  <p className="text-amber-700 dark:text-amber-300/90 text-[9.5px] bg-amber-50 dark:bg-amber-950/40 p-1.5 rounded border border-amber-200/60 dark:border-amber-900/40">
-                    ℹ️ <strong>Hinweis zur Aktualisierung:</strong> Google Kalender ruft externe Webcal-URLs in eigenen Server-Intervallen ab (meist alle paar Stunden). Auf unserem Server werden Änderungen bei jedem stündlichen Sync und bei jeder Fach-Auswahl sofort bereitgestellt.
+                    <strong>Google Kalender (Android / Web):</strong> Klicke auf &quot;Direkt in Google Kalender abonnieren&quot; oder öffne <em>calendar.google.com</em>, klicke links neben <em>&quot;Weitere Kalender&quot;</em> auf das <strong>+</strong> &gt; <em>&quot;Per URL hinzufügen&quot;</em> und füge die Feed-URL ein.
                   </p>
                 </div>
               )}

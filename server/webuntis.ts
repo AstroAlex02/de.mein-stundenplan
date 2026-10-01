@@ -947,6 +947,19 @@ export function getUserTimetable(userId: number, options: { fromDate?: string; t
       }
     } catch (e) {}
 
+    // Determine if this lesson/subject is hybrid (präsenz & online)
+    const isHybrid = isHybridEvent({
+      subjectName,
+      subjectLongName,
+      roomName: row.room_name,
+      roomLongName: row.room_long_name,
+      studentGroup,
+      lessonText,
+      periodText,
+      substText,
+      hybridSubjects: settings.hybridSubjects
+    });
+
     // Track all available subjects for filter UI across the whole semester
     if (!subjectCounts.has(subjectName)) {
       subjectCounts.set(subjectName, {
@@ -955,11 +968,12 @@ export function getUserTimetable(userId: number, options: { fromDate?: string; t
         count: 0,
         firstDate: dateFormatted,
         lastDate: dateFormatted,
-        isHybrid: false
+        isHybrid
       });
     }
     const subjTracker = subjectCounts.get(subjectName)!;
     subjTracker.count++;
+    if (isHybrid) subjTracker.isHybrid = true;
     if (dateFormatted < subjTracker.firstDate) subjTracker.firstDate = dateFormatted;
     if (dateFormatted > subjTracker.lastDate) subjTracker.lastDate = dateFormatted;
 
@@ -1012,7 +1026,7 @@ export function getUserTimetable(userId: number, options: { fromDate?: string; t
       isCancelled: Boolean(row.is_cancelled),
       isSubstitution: row.cell_state === 'SUBSTITUTION',
       isRoomChanged: false,
-      isHybrid: false,
+      isHybrid,
       originalRoomName,
       lessonText,
       periodText,
@@ -1044,7 +1058,11 @@ function escapeIcsText(str: string): string {
 export function generateIcsCalendar(
   lessons: TimetableLesson[],
   calendarName = 'Mein-Stundenplan',
-  options: { sequence?: number; lastModified?: Date; omitCancelled?: boolean } = {}
+  options: {
+    sequence?: number;
+    lastModified?: Date;
+    omitCancelled?: boolean;
+  } = {}
 ): string {
   const lastModDate = options.lastModified || new Date();
   const dtStampNow = lastModDate.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
@@ -1170,6 +1188,11 @@ export function generateIcsCalendar(
       if (options.omitCancelled) {
         continue;
       }
+
+      // Standard RFC 5545 STATUS:CANCELLED for both calendars:
+      // - Apple Calendar: natively strikes through the event and displays status "Abgesagt".
+      // - Google Calendar: automatically removes the cancelled event and frees the slot.
+      // - Summary remains clean (no [GESTRICHEN], no unicode hacks).
       lines.push(
         'BEGIN:VEVENT',
         `UID:${uid}`,
@@ -1178,8 +1201,8 @@ export function generateIcsCalendar(
         `SEQUENCE:${sequenceNum + 1}`,
         `DTSTART;TZID=Europe/Berlin:${dtStart}`,
         `DTEND;TZID=Europe/Berlin:${dtEnd}`,
-        `SUMMARY:${escapeIcsText(`[GESTRICHEN] ${summary}`)}`,
-        `DESCRIPTION:${escapeIcsText(`❌ VORLESUNG ENTFÄLLT: Diese Vorlesung wurde aus dem Stundenplan gestrichen!\n${description}`)}`,
+        `SUMMARY:${escapeIcsText(summary)}`,
+        `DESCRIPTION:${escapeIcsText(`❌ VORLESUNG ENTFÄLLT: Diese Vorlesung fällt aus!\n${description}`)}`,
         `LOCATION:${escapeIcsText(location)}`,
         'STATUS:CANCELLED',
         'TRANSP:TRANSPARENT',

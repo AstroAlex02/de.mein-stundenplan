@@ -49,17 +49,19 @@ function renderFormattedNote(text: string) {
 
 export interface LessonRoomFormat {
   displayText: string;
-  type: 'online' | 'in_person';
+  type: 'hybrid' | 'online' | 'in_person';
   badgeClasses: string;
 }
 
 /**
  * Format room display:
- * - Has physical room -> Room name (red/rose marked)
- * - No room or online -> Online (blue marked)
- * No hybrid Zusatzinfo is displayed.
+ * 1. Ist ein Fach hybrid und hat eine Raumnummer -> Raumnummer + Online (z.B. "207-006 + Online")
+ * 2. Fehlt eine Raumnummer oder rein online -> nur Online
+ * 3. Weder hybrid noch online -> nur der physische Raum (rot markiert)
+ * Die Kennzeichnung "hybrid" erscheint dabei ausschließlich in dieser Raumangabe, nicht als extra Notiz/Infoblase.
  */
 export function getLessonRoomFormat(lesson?: {
+  isHybrid?: boolean;
   roomName?: string;
   roomLongName?: string;
 } | null): LessonRoomFormat {
@@ -72,30 +74,43 @@ export function getLessonRoomFormat(lesson?: {
   }
 
   const room = (lesson.roomName || lesson.roomLongName || '').trim();
+  const isHybrid = Boolean(lesson.isHybrid);
 
   // Check if room is missing, dash, or explicitly contains online/virtual
   const isRoomEmpty = !room || room === '-' || room === '—' || room.toLowerCase() === 'kein raum';
   const isRoomOnlineText = /\b(online|virtuell\w*|zoom|teams|webex|bbb)\b/i.test(room);
   const hasRealPhysicalRoom = !isRoomEmpty && !isRoomOnlineText;
 
-  if (hasRealPhysicalRoom) {
+  // 1. Wenn ein Fach die Info hybrid hat und es eine Raumnummer gibt: Raumnummer + Online
+  if (isHybrid && hasRealPhysicalRoom) {
     return {
-      displayText: room,
-      type: 'in_person',
-      badgeClasses: 'bg-rose-50 dark:bg-rose-950/60 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800 font-bold'
+      displayText: `${room} + Online`,
+      type: 'hybrid',
+      badgeClasses: 'bg-purple-50 dark:bg-purple-950/60 text-purple-800 dark:text-purple-300 border border-purple-200 dark:border-purple-800 font-bold'
     };
   }
 
+  // 2. Fehlt eine Raumnummer oder rein online: nur Online
+  if (!hasRealPhysicalRoom || isRoomOnlineText) {
+    return {
+      displayText: 'Online',
+      type: 'online',
+      badgeClasses: 'bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800 font-semibold'
+    };
+  }
+
+  // 3. Weder hybrid noch online: nur den Raum (Feld rot markiert)
   return {
-    displayText: 'Online',
-    type: 'online',
-    badgeClasses: 'bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800 font-semibold'
+    displayText: room,
+    type: 'in_person',
+    badgeClasses: 'bg-rose-50 dark:bg-rose-950/60 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800 font-bold'
   };
 }
 
 /**
  * Helper to extract and format genuine student notes (Notizen für Schüler / Dozenten-Hinweise).
- * Explicitly ignores system tags like "hybrid", "online", "präsenz", internal IDs, or pure course codes.
+ * Explicitly ignores mode tags ("hybrid", "online", "präsenz", "präsenzveranstaltung") and internal IDs,
+ * so hybrid status NEVER triggers an info bubble or extra info note.
  */
 export function getStudentNotes(lesson?: {
   periodText?: string;
@@ -110,35 +125,36 @@ export function getStudentNotes(lesson?: {
     return { hasNotes: false, notes: [], combinedText: '' };
   }
 
-  const isTrivialOrTag = (text: string): boolean => {
-    const trimmed = text.trim();
-    if (!trimmed) return true;
-    if (/^\d+$/.test(trimmed)) return true;
-    if (/^Gruppe\s*\d+$/i.test(trimmed)) return true;
-    if (/^(hybrid|online|präsenz|präsenzveranstaltung)$/i.test(trimmed)) return true;
-    if (/^hybrid\s*,\s*weitere\s+räume/i.test(trimmed)) return true;
-    return false;
+  const cleanNoteText = (text: string): string => {
+    let t = (text || '').trim();
+    if (!t) return '';
+    // Pure numbers or catalog codes
+    if (/^\d+$/.test(t)) return '';
+    // Pure group indicators without actual notes
+    if (/^Gruppe\s*\d+$/i.test(t)) return '';
+    // Mode tags without instructions
+    if (/^(hybrid|online|präsenz|präsenzveranstaltung)$/i.test(t)) return '';
+    if (/^hybrid\s*,\s*weitere\s+räume/i.test(t)) return '';
+    // Strip leading "hybrid, " or "online, " if followed by a real note
+    t = t.replace(/^hybrid\s*,\s*/i, '').replace(/^online\s*,\s*/i, '').trim();
+    if (/^(hybrid|online|präsenz|präsenzveranstaltung)$/i.test(t)) return '';
+    return t;
   };
 
   const rawNotes: string[] = [];
 
-  if (lesson.periodText && !isTrivialOrTag(lesson.periodText)) {
-    rawNotes.push(lesson.periodText.trim());
-  }
-
-  if (lesson.substText && !isTrivialOrTag(lesson.substText)) {
-    const trimmedSubst = lesson.substText.trim();
-    if (!rawNotes.some(n => n.includes(trimmedSubst) || trimmedSubst.includes(n))) {
-      rawNotes.push(trimmedSubst);
+  const addNote = (str?: string) => {
+    if (!str) return;
+    const cleaned = cleanNoteText(str);
+    if (!cleaned) return;
+    if (!rawNotes.some(n => n.toLowerCase() === cleaned.toLowerCase() || n.includes(cleaned) || cleaned.includes(n))) {
+      rawNotes.push(cleaned);
     }
-  }
+  };
 
-  if (lesson.lessonText && !isTrivialOrTag(lesson.lessonText)) {
-    const trimmedLesson = lesson.lessonText.trim();
-    if (!rawNotes.some(n => n.includes(trimmedLesson) || trimmedLesson.includes(n))) {
-      rawNotes.push(trimmedLesson);
-    }
-  }
+  addNote(lesson.periodText);
+  addNote(lesson.substText);
+  addNote(lesson.lessonText);
 
   return {
     hasNotes: rawNotes.length > 0,
@@ -936,7 +952,9 @@ export const TimetableDashboard: React.FC<TimetableDashboardProps> = ({
                               </span>
                               <span
                                 title={
-                                  roomFormat.type === 'in_person'
+                                  roomFormat.type === 'hybrid'
+                                    ? `Hybrid: ${roomFormat.displayText}`
+                                    : roomFormat.type === 'in_person'
                                     ? `Raum: ${roomFormat.displayText}`
                                     : 'Online-Vorlesung'
                                 }

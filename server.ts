@@ -797,7 +797,10 @@ async function startServer() {
   app.get('/api/calendar/export.ics', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
     try {
       const timetable = getUserTimetable(req.user!.id);
-      const ics = generateIcsCalendar(timetable.lessons, `Stundenplan - ${req.user!.displayName}`);
+      const ics = generateIcsCalendar(
+        timetable.lessons,
+        `Stundenplan - ${req.user!.displayName}`
+      );
 
       res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
       res.setHeader('Content-Disposition', `attachment; filename="stundenplan_${req.user!.username}.ics"`);
