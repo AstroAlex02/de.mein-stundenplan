@@ -471,24 +471,36 @@ async function processClassWeek(
     }
 
     // 3. Raumänderung Check (only when not cancelled)
+    const formatCleanRoom = (r?: string) => {
+      const trimmed = (r || '').trim();
+      if (!trimmed || trimmed === '-' || trimmed === '—' || trimmed === '---' || trimmed.toLowerCase() === 'kein raum' || trimmed.toUpperCase() === 'TBA' || /\b(online|virtuell\w*)\b/i.test(trimmed)) {
+        return 'Online';
+      }
+      return trimmed;
+    };
+
     const roomChanges = block.filter(p => p.prev?.room_name && p.roomName && p.prev.room_name !== p.roomName && !p.prev.is_cancelled && !p.isCancelled);
     if (roomChanges.length > 0 && newlyCancelled.length === 0) {
-      changesDetected++;
-      const title = `🚨 Raumänderung: ${subjectName}`;
-      const message = `Der Raum für "${subjectName}" (${className}) am ${dateFormatted} (${timeRangeDesc}) wurde von "${roomChanges[0].prev.room_name}" auf "${roomChanges[0].roomName}" geändert.`;
+      const oldRoomClean = formatCleanRoom(roomChanges[0].prev.room_name);
+      const newRoomClean = formatCleanRoom(roomChanges[0].roomName);
+      if (oldRoomClean !== newRoomClean) {
+        changesDetected++;
+        const title = `🚨 Raumänderung: ${subjectName}`;
+        const message = `Der Raum für "${subjectName}" (${className}) am ${dateFormatted} (${timeRangeDesc}) wurde von "${oldRoomClean}" auf "${newRoomClean}" geändert.`;
 
-      for (const sub of subscribers) {
-        if (!sub.excludedSubjects.includes(subjectName)) {
-          addNotification(sub.userId, {
-            type: 'room_change',
-            title,
-            message,
-            lessonName: subjectName,
-            oldValue: roomChanges[0].prev.room_name,
-            newValue: roomChanges[0].roomName,
-            date: dateFormatted,
-            startTime: startTimeFormatted
-          });
+        for (const sub of subscribers) {
+          if (!sub.excludedSubjects.includes(subjectName)) {
+            addNotification(sub.userId, {
+              type: 'room_change',
+              title,
+              message,
+              lessonName: subjectName,
+              oldValue: oldRoomClean,
+              newValue: newRoomClean,
+              date: dateFormatted,
+              startTime: startTimeFormatted
+            });
+          }
         }
       }
     }
@@ -1136,8 +1148,16 @@ export function generateIcsCalendar(
       const first = group[0];
       const last = group[group.length - 1];
       const physicalRoom = group.find(l => {
-        const r = (l.roomName || '').trim();
-        return r && r !== '-' && r !== '—' && r.toLowerCase() !== 'kein raum';
+        const r = (l.roomName || l.roomLongName || '').trim();
+        return (
+          r &&
+          r !== '-' &&
+          r !== '—' &&
+          r !== '---' &&
+          r.toLowerCase() !== 'kein raum' &&
+          r.toUpperCase() !== 'TBA' &&
+          !/\b(online|virtuell\w*|zoom|teams|webex|bbb)\b/i.test(r)
+        );
       });
       mergedEvents.push({
         ...first,
@@ -1163,14 +1183,40 @@ export function generateIcsCalendar(
     const dtStamp = dtStampNow;
     const uid = `lesson-${lesson.id}-${lesson.classId}-${dateStr}@stundenplan-manager`;
 
-    let summary = lesson.subjectName;
-    if (lesson.roomName) {
-      summary += ` (${lesson.roomName})`;
+    // Room resolution for calendar subscription:
+    // If room is missing, removed, "Kein Raum", "---", "-", "—", "TBA", or indicates online -> display "Online"
+    const rawRoom = (lesson.roomName || lesson.roomLongName || '').trim();
+    const isRoomEmpty = (
+      !rawRoom ||
+      rawRoom === '-' ||
+      rawRoom === '—' ||
+      rawRoom === '---' ||
+      rawRoom.toLowerCase() === 'kein raum' ||
+      rawRoom.toUpperCase() === 'TBA'
+    );
+    const isRoomOnlineText = /\b(online|virtuell\w*|zoom|teams|webex|bbb)\b/i.test(rawRoom);
+    const hasPhysicalRoom = !isRoomEmpty && !isRoomOnlineText;
+
+    let displayRoom = 'Online';
+    if (lesson.isHybrid && hasPhysicalRoom) {
+      displayRoom = `${rawRoom} + Online`;
+    } else if (hasPhysicalRoom) {
+      displayRoom = rawRoom;
+    } else {
+      displayRoom = 'Online';
     }
 
-    let location = lesson.roomName || 'TBA';
+    let summary = lesson.subjectName;
+    if (displayRoom) {
+      summary += ` (${displayRoom})`;
+    }
+
+    let location = displayRoom;
 
     let description = `Fach: ${lesson.subjectLongName}\nKlasse: ${lesson.className}`;
+    if (displayRoom) {
+      description += `\nRaum: ${displayRoom}`;
+    }
     if (lesson.teacherName) {
       description += `\nDozent/in: ${lesson.teacherName}`;
     }
@@ -1211,6 +1257,10 @@ export function generateIcsCalendar(
       continue;
     }
 
+    const alarmDescription = displayRoom === 'Online'
+      ? `Erinnerung: ${lesson.subjectName} (Online)`
+      : `Erinnerung: ${lesson.subjectName} in Raum ${displayRoom}`;
+
     lines.push(
       'BEGIN:VEVENT',
       `UID:${uid}`,
@@ -1226,7 +1276,7 @@ export function generateIcsCalendar(
       'BEGIN:VALARM',
       'TRIGGER:-PT15M',
       'ACTION:DISPLAY',
-      `DESCRIPTION:${escapeIcsText(`Erinnerung: ${lesson.subjectName} in Raum ${lesson.roomName}`)}`,
+      `DESCRIPTION:${escapeIcsText(alarmDescription)}`,
       'END:VALARM',
       'END:VEVENT'
     );
